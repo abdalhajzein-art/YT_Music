@@ -1,54 +1,44 @@
-const https = require('https');
+export default async function handler(req, res) {
+  // السماح بالطلبات من أي مصدر (CORS)
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET');
 
-const instances = [
-    'https://pipedapi.kavin.rocks',
-    'https://api.piped.yt',
-    'https://pipedapi.privacy.com.de',
-    'https://pipedapi.adminforge.de'
-];
+  const query = req.query.q;
+  if (!query) {
+    return res.status(400).json({ error: 'الرجاء إدخال كلمة البحث q' });
+  }
 
-function fetchFromInstance(url) {
-    return new Promise((resolve, reject) => {
-        const req = https.get(url, { headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' } }, (res) => {
-            let data = '';
-            res.on('data', chunk => data += chunk);
-            res.on('end', () => {
-                if (res.statusCode === 200) {
-                    try {
-                        resolve(JSON.parse(data));
-                    } catch (e) {
-                        reject(new Error('Invalid JSON'));
-                    }
-                } else {
-                    reject(new Error(`Status code ${res.statusCode}`));
-                }
-            });
-        });
-        req.on('error', err => reject(err));
-        req.setTimeout(5000, () => {
-            req.destroy();
-            reject(new Error('Timeout'));
-        });
-    });
+  // Client ID عام ومستخرج من منصة ساوند كلاود
+  const clientId = 'iZIs9mchVcX5lhVRyQGGAYlNPVldzAoX';
+
+  try {
+    // البحث عن الأغاني عبر API ساوند كلاود V2
+    const searchUrl = `https://api-v2.soundcloud.com/search/tracks?q=${encodeURIComponent(query)}&client_id=${clientId}&limit=15`;
+    const searchResponse = await fetch(searchUrl);
+    const searchData = await searchResponse.json();
+
+    if (!searchData.collection) {
+      return res.status(404).json({ error: 'لم يتم العثور على نتائج' });
+    }
+
+    // تصفية وترتيب النتائج لتكون جاهزة لتطبيق الأندرويد
+    const tracks = searchData.collection.map(track => {
+      // البحث عن رابط التشغيل (Progressive stream)
+      const transcoding = track.media?.transcodings?.find(t => t.format.protocol === 'progressive');
+      
+      return {
+        id: track.id,
+        title: track.title,
+        artist: track.user?.username || 'مجهول',
+        duration: track.duration,
+        artwork: track.artwork_url ? track.artwork_url.replace('large', 't500x500') : null,
+        stream_endpoint: transcoding ? `${transcoding.url}?client_id=${clientId}` : null
+      };
+    }).filter(t => t.stream_endpoint !== null);
+
+    return res.status(200).json({ success: true, tracks });
+
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
+  }
 }
-
-module.exports = async (req, res) => {
-    const query = req.query.q;
-    if (!query) {
-        return res.status(400).json({ error: 'Missing query' });
-    }
-
-    res.setHeader('Access-Control-Allow-Origin', '*');
-
-    for (const instance of instances) {
-        try {
-            const url = `${instance}/search?q=${encodeURIComponent(query)}&filter=videos`;
-            const result = await fetchFromInstance(url);
-            return res.status(200).json(result);
-        } catch (e) {
-            continue; // جرب السيرفر التالي إذا فشل الحالي
-        }
-    }
-
-    return res.status(500).json({ error: 'All Piped instances failed' });
-};
