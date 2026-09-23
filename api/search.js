@@ -1,3 +1,25 @@
+// وظيفة ذكية لاستخراج أحدث Client ID من موقع ساوند كلاود تلقائياً
+async function getFreshClientId() {
+  try {
+    const htmlRes = await fetch('https://soundcloud.com', {
+      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' }
+    });
+    const html = await htmlRes.text();
+    const scriptUrls = [...html.matchAll(/src="(https:\/\/[^"]+\.js)"/g)].map(m => m[1]);
+    
+    // البحث في ملفات الجافاسكريفت الأخيرة عن الـ client_id
+    for (const scriptUrl of scriptUrls.slice(-6)) {
+      const scriptRes = await fetch(scriptUrl);
+      const scriptText = await scriptRes.text();
+      const match = scriptText.match(/client_id["']?\s*[:=]\s*["']([a-zA-Z0-9]{32})["']/);
+      if (match) return match[1];
+    }
+  } catch (e) {
+    // في حال حدث أي عارض، نعود لمعرف احتياطي
+  }
+  return 'iZIs9mchVcX5lhVRyQGGAYlNPVldzAoX';
+}
+
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET');
@@ -7,17 +29,15 @@ export default async function handler(req, res) {
     return res.status(400).json({ error: 'الرجاء إدخال كلمة البحث q' });
   }
 
-  const clientId = 'iZIs9mchVcX5lhVRyQGGAYlNPVldzAoX';
-
   try {
+    // جلب معرف طازج حصرياً لهذه الطلبية
+    const clientId = await getFreshClientId();
     const searchUrl = `https://api-v2.soundcloud.com/search/tracks?q=${encodeURIComponent(query)}&client_id=${clientId}&limit=15`;
     
-    // إضافة ترويسات المتصفح لمنع حظر الطلب
     const searchResponse = await fetch(searchUrl, {
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'application/json, text/javascript, */*; q=0.01',
-        'Accept-Language': 'en-US,en;q=0.9'
+        'Accept': 'application/json, text/javascript, */*; q=0.01'
       }
     });
 
