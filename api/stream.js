@@ -1,54 +1,25 @@
-const https = require('https');
-
-const instances = [
-    'https://pipedapi.kavin.rocks',
-    'https://api.piped.yt',
-    'https://pipedapi.privacy.com.de',
-    'https://pipedapi.adminforge.de'
-];
-
-function fetchFromInstance(url) {
-    return new Promise((resolve, reject) => {
-        const req = https.get(url, { headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' } }, (res) => {
-            let data = '';
-            res.on('data', chunk => data += chunk);
-            res.on('end', () => {
-                if (res.statusCode === 200) {
-                    try {
-                        resolve(JSON.parse(data));
-                    } catch (e) {
-                        reject(new Error('Invalid JSON'));
-                    }
-                } else {
-                    reject(new Error(`Status code ${res.statusCode}`));
-                }
-            });
-        });
-        req.on('error', err => reject(err));
-        req.setTimeout(5000, () => {
-            req.destroy();
-            reject(new Error('Timeout'));
-        });
-    });
-}
-
 module.exports = async (req, res) => {
-    const videoId = req.query.id;
-    if (!videoId) {
-        return res.status(400).json({ error: 'Missing video ID' });
+  // السماح بالطلبات من أي مصدر (CORS)
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET');
+
+  const streamUrl = req.query.url;
+  if (!streamUrl) {
+    return res.status(400).json({ error: 'الرجاء إرسال رابط الـ stream' });
+  }
+
+  try {
+    // جلب الرابط النهائي المباشر للصوت من ساوند كلاود
+    const response = await fetch(streamUrl);
+    const data = await response.json();
+
+    if (data && data.url) {
+      return res.status(200).json({ success: true, direct_url: data.url });
+    } else {
+      return res.status(404).json({ error: 'لم يتم العثور على الرابط المباشر' });
     }
 
-    res.setHeader('Access-Control-Allow-Origin', '*');
-
-    for (const instance of instances) {
-        try {
-            const url = `${instance}/streams/${videoId}`;
-            const result = await fetchFromInstance(url);
-            return res.status(200).json(result);
-        } catch (e) {
-            continue; // جرب السيرفر التالي
-        }
-    }
-
-    return res.status(500).json({ error: 'All Piped instances failed' });
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
+  }
 };
