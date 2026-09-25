@@ -34,7 +34,7 @@ async function getFreshClientId(forceRefresh = false) {
   return cachedClientId || 'iZIs9mchVcX5lhVRyQGGAYlNPVldzAoX';
 }
 
-// 🎲 دالة خلط النتائج عشوائياً لتنويع نتائج الصفحة الحالية
+// 🎲 دالة خلط النتائج عشوائياً
 function shuffleArray(array) {
   for (let i = array.length - 1; i > 0; i--) {
     const j = Math.floor(Math.random() * (i + 1));
@@ -43,10 +43,9 @@ function shuffleArray(array) {
   return array;
 }
 
-// 🎯 أولويات Opus presets (من الأعلى توفيراً إلى الأقل)
-// 128 kbps هو الأفضل لتوازن الحجم/الجودة مع SoundCloud
+// 🎯 أولويات Opus presets (128 kbps = الأفضل توازناً)
 const OPUS_PRIORITY = [
-  'opus_0_2',   // 128 kbps (الأفضل توازن)
+  'opus_0_2',   // 128 kbps
   'opus_0_1',   // 96 kbps
   'opus_0_0',   // 64 kbps
 ];
@@ -55,8 +54,7 @@ export default async function handler(req, res) {
   // 🌐 CORS
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET');
-  // 🆕 Cache للـ search على Vercel Edge: 5 دقائق
-  // نفس البحث خلال 5 دقائق = رد فوري بدون نداء SoundCloud
+  // 🆕 Cache للبحث على Vercel Edge: 5 دقائق
   res.setHeader('Cache-Control', 's-maxage=300, stale-while-revalidate=600');
 
   const query = req.query.q;
@@ -105,14 +103,14 @@ export default async function handler(req, res) {
     let tracks = searchData.collection.map(track => {
       const transcodings = track.media?.transcodings || [];
 
-      // 🎯 1. البحث عن Opus بالأولوية المحددة (128 kbps أولاً)
+      // 🎯 1. البحث عن Opus بالأولوية (128 kbps أولاً)
       let transcoding = null;
       for (const preset of OPUS_PRIORITY) {
         transcoding = transcodings.find(t => t.preset && t.preset.includes(preset));
         if (transcoding) break;
       }
 
-      // 🎯 2. إذا ما لقينا Opus محدد، نبحث عن أي Opus
+      // 🎯 2. أي Opus متوفر
       if (!transcoding) {
         transcoding = transcodings.find(t => 
           (t.preset && t.preset.includes('opus')) || 
@@ -120,19 +118,19 @@ export default async function handler(req, res) {
         );
       }
 
-      // 🔄 3. احتياطي: Progressive (MP3)
+      // 🔄 3. احتياطي: Progressive MP3
       if (!transcoding) {
         transcoding = transcodings.find(t => t.format?.protocol === 'progressive');
       }
 
-      // 🔄 4. احتياطي أخير: أول بث متوفر
+      // 🔄 4. احتياطي أخير
       if (!transcoding && transcodings.length > 0) {
         transcoding = transcodings[0];
       }
 
-      // 🖼️ تصغير الغلاف إلى 100x100 (large) لتوفير البيانات
+      // 🖼️ صورة احترافية 500x500
       const artwork = track.artwork_url 
-        ? track.artwork_url.replace(/-t\d+x\d+|original/, '-large')
+        ? track.artwork_url.replace(/-t\d+x\d+|original/, '-t500x500')
         : null;
 
       return {
@@ -141,12 +139,12 @@ export default async function handler(req, res) {
         artist: track.user?.username || 'مجهول',
         duration: track.duration,
         artwork: artwork,
-        // 🆕 بدون client_id! stream.js سيضيفه طازجاً عند الطلب
+        // 🆕 بدون client_id — stream.js سيضيفه طازجاً
         stream_endpoint: transcoding ? transcoding.url : null
       };
     }).filter(t => t.stream_endpoint !== null);
 
-    // 🎲 خلط الأغاني للدفعة الحالية
+    // 🎲 خلط النتائج
     tracks = shuffleArray(tracks);
 
     return res.status(200).json({ 
@@ -159,4 +157,4 @@ export default async function handler(req, res) {
   } catch (error) {
     return res.status(500).json({ error: error.message });
   }
-        }
+                                    }
