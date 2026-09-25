@@ -33,12 +33,12 @@ async function getFreshClientId(forceRefresh = false) {
   return cachedClientId || 'iZIs9mchVcX5lhVRyQGGAYlNPVldzAoX';
 }
 
-// 🆕 دالة مساعدة: إزالة client_id من الرابط
+// 🆕 إزالة client_id من الرابط
 function stripClientId(url) {
   return url.replace(/[?&]client_id=[a-zA-Z0-9]{32}/, '');
 }
 
-// 🆕 دالة مساعدة: إضافة client_id للرابط
+// 🆕 إضافة client_id للرابط
 function addClientId(url, clientId) {
   const sep = url.includes('?') ? '&' : '?';
   return `${url}${sep}client_id=${clientId}`;
@@ -49,9 +49,8 @@ export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET');
   
-  // 🆕 Cache على Vercel Edge لمدة 20 دقيقة
-  // SoundCloud URLs صالحة ~30 دقيقة، لذا 20 دقيقة آمنة
-  // كل طلب من نفس المستخدم خلال 20 دقيقة = رد فوري بدون نداء SoundCloud
+  // 🆕 Cache على Vercel Edge: 20 دقيقة
+  // SoundCloud URLs صالحة ~30 دقيقة
   res.setHeader('Cache-Control', 's-maxage=1200, stale-while-revalidate=300');
 
   let streamUrl = req.query.url;
@@ -60,21 +59,11 @@ export default async function handler(req, res) {
   }
 
   try {
-    // 🎯 استخراج الـ client_id من الرابط (إذا موجود) قبل الـ cache
-    const clientIdMatch = streamUrl.match(/[?&]client_id=([a-zA-Z0-9]{32})/);
-    const clientIdInUrl = clientIdMatch ? clientIdMatch[1] : null;
-    
-    // 🆕 إزالة client_id للحصول على رابط نظيف (cache key موحد)
+    // 🎯 إزالة client_id القديم (cache key موحد)
     const cleanUrl = stripClientId(streamUrl);
     
     // الحصول على client_id طازج
     let clientId = await getFreshClientId();
-    if (clientIdInUrl && clientIdInUrl !== clientId) {
-      // لا نستخدم client_id القديم إلا إذا كان طازجاً
-      clientId = clientIdInUrl;
-    }
-    
-    // إضافة client_id للرابط
     const requestUrl = addClientId(cleanUrl, clientId);
 
     let response = await fetch(requestUrl, {
@@ -84,7 +73,7 @@ export default async function handler(req, res) {
       }
     });
 
-    // 🔄 تجديد Client ID إذا انتهت صلاحيته
+    // 🔄 تجديد عند انتهاء الصلاحية
     if (response.status === 401 || response.status === 403) {
       const freshClientId = await getFreshClientId(true);
       const retryUrl = addClientId(cleanUrl, freshClientId);
@@ -117,4 +106,4 @@ export default async function handler(req, res) {
   } catch (error) {
     return res.status(500).json({ error: error.message });
   }
-        }
+}
