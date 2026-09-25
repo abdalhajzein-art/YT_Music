@@ -43,12 +43,23 @@ function shuffleArray(array) {
   return array;
 }
 
+// 🎯 أولويات Opus presets (من الأعلى توفيراً إلى الأقل)
+// 128 kbps هو الأفضل لتوازن الحجم/الجودة مع SoundCloud
+const OPUS_PRIORITY = [
+  'opus_0_2',   // 128 kbps (الأفضل توازن)
+  'opus_0_1',   // 96 kbps
+  'opus_0_0',   // 64 kbps
+];
+
 export default async function handler(req, res) {
+  // 🌐 CORS
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET');
+  // 🆕 Cache للـ search على Vercel Edge: 5 دقائق
+  // نفس البحث خلال 5 دقائق = رد فوري بدون نداء SoundCloud
+  res.setHeader('Cache-Control', 's-maxage=300, stale-while-revalidate=600');
 
   const query = req.query.q;
-  // 🎯 دعم التصفح اللانهائي من أندرويد عبر معاملات offset و limit
   const offset = req.query.offset || 0;
   const limit = req.query.limit || 30;
 
@@ -80,7 +91,9 @@ export default async function handler(req, res) {
     }
 
     if (!searchResponse.ok) {
-      return res.status(searchResponse.status).json({ error: `SoundCloud API Error: ${searchResponse.statusText}` });
+      return res.status(searchResponse.status).json({ 
+        error: `SoundCloud API Error: ${searchResponse.statusText}` 
+      });
     }
 
     const searchData = await searchResponse.json();
@@ -92,24 +105,35 @@ export default async function handler(req, res) {
     let tracks = searchData.collection.map(track => {
       const transcodings = track.media?.transcodings || [];
 
-      // 🎯 1. إعطاء الأولوية لترميز Opus الخفيف والموفر للبيانات
-      let transcoding = transcodings.find(t => 
-        (t.preset && t.preset.includes('opus')) || 
-        (t.format && t.format.mime_type && t.format.mime_type.includes('opus'))
-      );
+      // 🎯 1. البحث عن Opus بالأولوية المحددة (128 kbps أولاً)
+      let transcoding = null;
+      for (const preset of OPUS_PRIORITY) {
+        transcoding = transcodings.find(t => t.preset && t.preset.includes(preset));
+        if (transcoding) break;
+      }
 
-      // 🔄 2. خيار احتياطي أول: Progressive (MP3)
+      // 🎯 2. إذا ما لقينا Opus محدد، نبحث عن أي Opus
+      if (!transcoding) {
+        transcoding = transcodings.find(t => 
+          (t.preset && t.preset.includes('opus')) || 
+          (t.format && t.format.mime_type && t.format.mime_type.includes('opus'))
+        );
+      }
+
+      // 🔄 3. احتياطي: Progressive (MP3)
       if (!transcoding) {
         transcoding = transcodings.find(t => t.format?.protocol === 'progressive');
       }
 
-      // 🔄 3. خيار احتياطي أخير: أول بث متوفر
+      // 🔄 4. احتياطي أخير: أول بث متوفر
       if (!transcoding && transcodings.length > 0) {
         transcoding = transcodings[0];
       }
 
-      // 🖼️ تصغير الغلاف إلى النسخة الخفيفة (large) لتوفير البيانات
-      const artwork = track.artwork_url ? track.artwork_url.replace(/t500x500|original/g, 'large') : null;
+      // 🖼️ تصغير الغلاف إلى 100x100 (large) لتوفير البيانات
+      const artwork = track.artwork_url 
+        ? track.artwork_url.replace(/-t\d+x\d+|original/, '-large')
+        : null;
 
       return {
         id: track.id,
@@ -117,7 +141,8 @@ export default async function handler(req, res) {
         artist: track.user?.username || 'مجهول',
         duration: track.duration,
         artwork: artwork,
-        stream_endpoint: transcoding ? `${transcoding.url}?client_id=${clientId}` : null
+        // 🆕 بدون client_id! stream.js سيضيفه طازجاً عند الطلب
+        stream_endpoint: transcoding ? transcoding.url : null
       };
     }).filter(t => t.stream_endpoint !== null);
 
@@ -134,4 +159,4 @@ export default async function handler(req, res) {
   } catch (error) {
     return res.status(500).json({ error: error.message });
   }
-}
+        }
