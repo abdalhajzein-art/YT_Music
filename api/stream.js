@@ -1,7 +1,7 @@
-// 🧠 ذاكرة مؤقتة لـ Client ID لتجديده تلقائياً إذا انتهت صلاحيته أثناء طلب التشغيل
+// 🧠 ذاكرة مؤقتة لـ Client ID
 let cachedClientId = null;
 let lastFetchTime = 0;
-const CACHE_DURATION = 2 * 60 * 60 * 1000;
+const CACHE_DURATION = 2 * 60 * 60 * 1000; // ساعتان
 
 async function getFreshClientId(forceRefresh = false) {
   const now = Date.now();
@@ -33,9 +33,26 @@ async function getFreshClientId(forceRefresh = false) {
   return cachedClientId || 'iZIs9mchVcX5lhVRyQGGAYlNPVldzAoX';
 }
 
+// 🆕 دالة مساعدة: إزالة client_id من الرابط
+function stripClientId(url) {
+  return url.replace(/[?&]client_id=[a-zA-Z0-9]{32}/, '');
+}
+
+// 🆕 دالة مساعدة: إضافة client_id للرابط
+function addClientId(url, clientId) {
+  const sep = url.includes('?') ? '&' : '?';
+  return `${url}${sep}client_id=${clientId}`;
+}
+
 export default async function handler(req, res) {
+  // 🌐 CORS
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET');
+  
+  // 🆕 Cache على Vercel Edge لمدة 20 دقيقة
+  // SoundCloud URLs صالحة ~30 دقيقة، لذا 20 دقيقة آمنة
+  // كل طلب من نفس المستخدم خلال 20 دقيقة = رد فوري بدون نداء SoundCloud
+  res.setHeader('Cache-Control', 's-maxage=1200, stale-while-revalidate=300');
 
   let streamUrl = req.query.url;
   if (!streamUrl) {
@@ -43,20 +60,36 @@ export default async function handler(req, res) {
   }
 
   try {
-    let response = await fetch(streamUrl, {
+    // 🎯 استخراج الـ client_id من الرابط (إذا موجود) قبل الـ cache
+    const clientIdMatch = streamUrl.match(/[?&]client_id=([a-zA-Z0-9]{32})/);
+    const clientIdInUrl = clientIdMatch ? clientIdMatch[1] : null;
+    
+    // 🆕 إزالة client_id للحصول على رابط نظيف (cache key موحد)
+    const cleanUrl = stripClientId(streamUrl);
+    
+    // الحصول على client_id طازج
+    let clientId = await getFreshClientId();
+    if (clientIdInUrl && clientIdInUrl !== clientId) {
+      // لا نستخدم client_id القديم إلا إذا كان طازجاً
+      clientId = clientIdInUrl;
+    }
+    
+    // إضافة client_id للرابط
+    const requestUrl = addClientId(cleanUrl, clientId);
+
+    let response = await fetch(requestUrl, {
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'Accept': 'application/json, text/javascript, */*; q=0.01'
       }
     });
 
-    // 🔄 إذا كان مفتاح client_id المرفق بالرابط قد انتهت صلاحيته، نجدده فوراً ونعيد الطلب
+    // 🔄 تجديد Client ID إذا انتهت صلاحيته
     if (response.status === 401 || response.status === 403) {
       const freshClientId = await getFreshClientId(true);
-      // استبدال Client ID القديم بالجديد داخل رابط الطلب
-      streamUrl = streamUrl.replace(/client_id=[a-zA-Z0-9]{32}/, `client_id=${freshClientId}`);
+      const retryUrl = addClientId(cleanUrl, freshClientId);
       
-      response = await fetch(streamUrl, {
+      response = await fetch(retryUrl, {
         headers: {
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
           'Accept': 'application/json, text/javascript, */*; q=0.01'
@@ -65,13 +98,18 @@ export default async function handler(req, res) {
     }
 
     if (!response.ok) {
-      return res.status(response.status).json({ error: `Stream Error: ${response.statusText}` });
+      return res.status(response.status).json({ 
+        error: `Stream Error: ${response.statusText}` 
+      });
     }
 
     const data = await response.json();
 
     if (data && data.url) {
-      return res.status(200).json({ success: true, direct_url: data.url });
+      return res.status(200).json({ 
+        success: true, 
+        direct_url: data.url 
+      });
     } else {
       return res.status(404).json({ error: 'لم يتم العثور على الرابط المباشر' });
     }
@@ -79,4 +117,4 @@ export default async function handler(req, res) {
   } catch (error) {
     return res.status(500).json({ error: error.message });
   }
-}
+        }
