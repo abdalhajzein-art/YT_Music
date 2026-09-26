@@ -50,6 +50,21 @@ const OPUS_PRIORITY = [
   'opus_0_0',   // 64 kbps
 ];
 
+// 🖼️ دالة تحويل رابط الصورة إلى أعلى جودة متوفرة
+function getHighQualityArtwork(artworkUrl) {
+  if (!artworkUrl) return null;
+  
+  // 1) إزالة أي حجم موجود في الرابط (-large, -t500x500, -small, -tiny, -original, إلخ)
+  const baseUrl = artworkUrl.replace(/-(t\d+x\d+|large|small|tiny|mini|crop|badge|original)(\.\w+)?$/i, '');
+  
+  // 2) استخراج الامتداد (jpg, png, webp)
+  const extMatch = artworkUrl.match(/\.(jpg|jpeg|png|webp)$/i);
+  const ext = extMatch ? extMatch[1] : 'jpg';
+  
+  // 3) إضافة -t500x500 (500×500) — الأفضل توازناً بين الجودة والحجم
+  return `${baseUrl}-t500x500.${ext}`;
+}
+
 export default async function handler(req, res) {
   // 🌐 CORS
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -128,10 +143,8 @@ export default async function handler(req, res) {
         transcoding = transcodings[0];
       }
 
-      // 🖼️ صورة احترافية 500x500
-      const artwork = track.artwork_url 
-        ? track.artwork_url.replace(/-t\d+x\d+|original/, '-t500x500')
-        : null;
+      // 🖼️ تحويل الصورة إلى -t500x500 (500×500) لجودة عالية
+      const artwork = getHighQualityArtwork(track.artwork_url);
 
       return {
         id: track.id,
@@ -157,4 +170,4 @@ export default async function handler(req, res) {
   } catch (error) {
     return res.status(500).json({ error: error.message });
   }
-                                    }
+     }
