@@ -1,7 +1,7 @@
 // 🧠 ذاكرة مؤقتة لـ Client ID
 let cachedClientId = null;
 let lastFetchTime = 0;
-const CACHE_DURATION = 2 * 60 * 60 * 1000; // ساعتان
+const CACHE_DURATION = 2 * 60 * 60 * 1000;
 
 async function getFreshClientId(forceRefresh = false) {
   const now = Date.now();
@@ -33,25 +33,14 @@ async function getFreshClientId(forceRefresh = false) {
   return cachedClientId || 'iZIs9mchVcX5lhVRyQGGAYlNPVldzAoX';
 }
 
-// 🆕 إزالة client_id من الرابط
-function stripClientId(url) {
-  return url.replace(/[?&]client_id=[a-zA-Z0-9]{32}/, '');
-}
-
-// 🆕 إضافة client_id للرابط
-function addClientId(url, clientId) {
-  const sep = url.includes('?') ? '&' : '?';
-  return `${url}${sep}client_id=${clientId}`;
-}
-
 export default async function handler(req, res) {
-  // 🌐 CORS
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
   
-  // 🆕 Cache على Vercel Edge: 20 دقيقة
-  // SoundCloud URLs صالحة ~30 دقيقة
-  res.setHeader('Cache-Control', 's-maxage=1200, stale-while-revalidate=300');
+  // Handle preflight
+  if (req.method === 'OPTIONS') {
+    return res.status(200).end();
+  }
 
   let streamUrl = req.query.url;
   if (!streamUrl) {
@@ -59,51 +48,105 @@ export default async function handler(req, res) {
   }
 
   try {
-    // 🎯 إزالة client_id القديم (cache key موحد)
-    const cleanUrl = stripClientId(streamUrl);
-    
-    // الحصول على client_id طازج
+    // 1. جلب client_id طازج
     let clientId = await getFreshClientId();
-    const requestUrl = addClientId(cleanUrl, clientId);
-
-    let response = await fetch(requestUrl, {
+    
+    // 2. طلب direct_url من SoundCloud
+    let soundcloudUrl = streamUrl;
+    if (!soundcloudUrl.includes('client_id=')) {
+      const sep = soundcloudUrl.includes('?') ? '&' : '?';
+      soundcloudUrl = `${soundcloudUrl}${sep}client_id=${clientId}`;
+    }
+    
+    let response = await fetch(soundcloudUrl, {
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'Accept': 'application/json, text/javascript, */*; q=0.01'
       }
     });
 
-    // 🔄 تجديد عند انتهاء الصلاحية
+    // تجديد client_id
     if (response.status === 401 || response.status === 403) {
       const freshClientId = await getFreshClientId(true);
-      const retryUrl = addClientId(cleanUrl, freshClientId);
+      const sep = streamUrl.includes('?') ? '&' : '?';
+      soundcloudUrl = `${streamUrl}${sep}client_id=${freshClientId}`;
       
-      response = await fetch(retryUrl, {
+      response = await fetch(soundcloudUrl, {
         headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
           'Accept': 'application/json, text/javascript, */*; q=0.01'
         }
       });
     }
 
     if (!response.ok) {
-      return res.status(response.status).json({ 
-        error: `Stream Error: ${response.statusText}` 
-      });
+      return res.status(response.status).json({ error: `SoundCloud Error: ${response.statusText}` });
     }
 
     const data = await response.json();
 
-    if (data && data.url) {
-      return res.status(200).json({ 
-        success: true, 
-        direct_url: data.url 
-      });
-    } else {
+    if (!data || !data.url) {
       return res.status(404).json({ error: 'لم يتم العثور على الرابط المباشر' });
     }
+
+    // 🆕 الوضع 1: معلومات فقط (JSON)
+    if (req.query.info === 'true') {
+      // نرجّع رابط Proxy بدل SoundCloud CDN
+      const proxyUrl = `${req.headers['x-forwarded-proto'] || 'https'}://${req.headers.host}/api/stream?url=${encodeURIComponent(streamUrl)}&proxy=true`;
+      
+      res.setHeader('Cache-Control', 's-maxage=1200, stale-while-revalidate=300');
+      
+      return res.status(200).json({ 
+        success: true, 
+        direct_url: proxyUrl
+      });
+    }
+
+    // 🆕 الوضع 2: Proxy للصوت (default)
+    const range = req.headers.range || 'bytes=0-';
+    
+    const audioResponse = await fetch(data.url, {
+      headers: {
+        'Range': range,
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+      }
+    });
+    
+    if (!audioResponse.ok && audioResponse.status !== 206) {
+      return res.status(audioResponse.status).json({ error: 'فشل جلب الصوت' });
+    }
+    
+    res.status(audioResponse.status);
+    
+    // نسخ الـ headers المهمة
+    ['content-type', 'content-length', 'content-range', 'accept-ranges'].forEach(h => {
+      const v = audioResponse.headers.get(h);
+      if (v) res.setHeader(h, v);
+    });
+    
+    res.setHeader('Cache-Control', 'public, max-age=3600');
+    
+    // بث الصوت
+    const reader = audioResponse.body.getReader();
+    let closed = false;
+    res.on('close', () => {
+      closed = true;
+      reader.cancel().catch(() => {});
+    });
+    
+    try {
+      while (!closed) {
+        const { done, value } = await reader.read();
+        if (done || res.writableEnded) break;
+        res.write(value);
+      }
+    } catch (e) {
+      // connection closed
+    }
+    
+    return res.end();
 
   } catch (error) {
     return res.status(500).json({ error: error.message });
   }
-}
+        }
