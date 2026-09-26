@@ -36,8 +36,8 @@ async function getFreshClientId(forceRefresh = false) {
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Range, Content-Type');
   
-  // Handle preflight
   if (req.method === 'OPTIONS') {
     return res.status(200).end();
   }
@@ -48,10 +48,8 @@ export default async function handler(req, res) {
   }
 
   try {
-    // 1. جلب client_id طازج
     let clientId = await getFreshClientId();
     
-    // 2. طلب direct_url من SoundCloud
     let soundcloudUrl = streamUrl;
     if (!soundcloudUrl.includes('client_id=')) {
       const sep = soundcloudUrl.includes('?') ? '&' : '?';
@@ -65,7 +63,6 @@ export default async function handler(req, res) {
       }
     });
 
-    // تجديد client_id
     if (response.status === 401 || response.status === 403) {
       const freshClientId = await getFreshClientId(true);
       const sep = streamUrl.includes('?') ? '&' : '?';
@@ -89,10 +86,14 @@ export default async function handler(req, res) {
       return res.status(404).json({ error: 'لم يتم العثور على الرابط المباشر' });
     }
 
+    // =====================================================
     // 🆕 الوضع 1: معلومات فقط (JSON)
+    // =====================================================
     if (req.query.info === 'true') {
       // نرجّع رابط Proxy بدل SoundCloud CDN
-      const proxyUrl = `${req.headers['x-forwarded-proto'] || 'https'}://${req.headers.host}/api/stream?url=${encodeURIComponent(streamUrl)}&proxy=true`;
+      const protocol = req.headers['x-forwarded-proto'] || 'https';
+      const host = req.headers.host;
+      const proxyUrl = `${protocol}://${host}/api/stream?url=${encodeURIComponent(streamUrl)}&proxy=true`;
       
       res.setHeader('Cache-Control', 's-maxage=1200, stale-while-revalidate=300');
       
@@ -102,7 +103,9 @@ export default async function handler(req, res) {
       });
     }
 
+    // =====================================================
     // 🆕 الوضع 2: Proxy للصوت (default)
+    // =====================================================
     const range = req.headers.range || 'bytes=0-';
     
     const audioResponse = await fetch(data.url, {
@@ -118,7 +121,6 @@ export default async function handler(req, res) {
     
     res.status(audioResponse.status);
     
-    // نسخ الـ headers المهمة
     ['content-type', 'content-length', 'content-range', 'accept-ranges'].forEach(h => {
       const v = audioResponse.headers.get(h);
       if (v) res.setHeader(h, v);
@@ -126,7 +128,6 @@ export default async function handler(req, res) {
     
     res.setHeader('Cache-Control', 'public, max-age=3600');
     
-    // بث الصوت
     const reader = audioResponse.body.getReader();
     let closed = false;
     res.on('close', () => {
@@ -141,7 +142,7 @@ export default async function handler(req, res) {
         res.write(value);
       }
     } catch (e) {
-      // connection closed
+      // connection closed by client
     }
     
     return res.end();
