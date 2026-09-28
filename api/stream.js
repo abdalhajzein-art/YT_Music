@@ -33,30 +33,36 @@ async function getFreshClientId(forceRefresh = false) {
   return cachedClientId || 'iZIs9mchVcX5lhVRyQGGAYlNPVldzAoX';
 }
 
-// 🆕 دالة للحصول على رابط Progressive (MP3) بدلاً من HLS
-async function getProgressiveStreamUrl(transcodings, clientId) {
+// 🆕 دالة ذكية للبحث عن أفضل صيغة صوت مباشرة مدعومة (MP3, AAC وغيرها) وتجنب HLS
+async function getBestProgressiveStreamUrl(transcodings, clientId) {
   if (!transcodings || !Array.isArray(transcodings) || transcodings.length === 0) {
     return null;
   }
 
-  // 🎯 الأولوية 1: ابحث عن transcoding من نوع "progressive"
-  let progressiveTranscoding = transcodings.find(t => 
+  // تصفية جميع الـ transcodings التي تعتمد على الـ progressive فقط (مستبعدين HLS تماماً)
+  const progressiveOptions = transcodings.filter(t => 
     t.format && t.format.protocol === 'progressive'
   );
 
-  // 🎯 الأولوية 2: إذا لم يوجد، جرب "hls"
-  if (!progressiveTranscoding) {
-    progressiveTranscoding = transcodings.find(t => 
-      t.format && t.format.protocol === 'hls'
-    );
-  }
-
-  if (!progressiveTranscoding) {
+  if (progressiveOptions.length === 0) {
     return null;
   }
 
-  // احصل على رابط الـ stream الفعلي
-  let streamApiUrl = progressiveTranscoding.url;
+  // نرتب الأولوية للصيغ التي يفهمهاMediaPlayer بكفاءة عالية (MP3 أولاً، ثم AAC/M4A، ثم أي صيغة progressive أخرى)
+  progressiveOptions.sort((a, b) => {
+    const mimeA = (a.format.mime_type || '').toLowerCase();
+    const mimeB = (b.format.mime_type || '').toLowerCase();
+    
+    if (mimeA.includes('mpeg') || mimeA.includes('mp3')) return -1;
+    if (mimeB.includes('mpeg') || mimeB.includes('mp3')) return 1;
+    if (mimeA.includes('aac') || mimeA.includes('mp4')) return -1;
+    if (mimeB.includes('aac') || mimeB.includes('mp4')) return 1;
+    return 0;
+  });
+
+  const bestTranscoding = progressiveOptions[0];
+  let streamApiUrl = bestTranscoding.url;
+  
   if (!streamApiUrl.includes('client_id=')) {
     const sep = streamApiUrl.includes('?') ? '&' : '?';
     streamApiUrl = `${streamApiUrl}${sep}client_id=${clientId}`;
@@ -71,14 +77,16 @@ async function getProgressiveStreamUrl(transcodings, clientId) {
     });
 
     if (!streamRes.ok) {
-      console.error('فشل جلب stream URL:', streamRes.status);
       return null;
     }
 
     const streamData = await streamRes.json();
-    return streamData.url || null;
+    return {
+      url: streamData.url || null,
+      mimeType: bestTranscoding.format.mime_type || 'audio/mpeg'
+    };
   } catch (e) {
-    console.error('خطأ في getProgressiveStreamUrl:', e);
+    console.error('خطأ في جلب الرابط المباشر:', e);
     return null;
   }
 }
@@ -137,39 +145,38 @@ export default async function handler(req, res) {
     }
 
     // =====================================================
-    // 🆕 احصل على رابط Progressive إن أمكن
+    // 🎯 جلب أفضل صيغة مباشرة (تفضيل MP3/AAC واستبعاد HLS)
     // =====================================================
-    let directUrl = data.url; // افتراضي
-    let protocol = 'hls';
+    let directUrl = null;
+    let mimeType = 'audio/mpeg';
 
     if (data.media && data.media.transcodings) {
-      const progressiveUrl = await getProgressiveStreamUrl(data.media.transcodings, clientId);
-      if (progressiveUrl) {
-        directUrl = progressiveUrl;
-        protocol = 'progressive';
+      const streamInfo = await getBestProgressiveStreamUrl(data.media.transcodings, clientId);
+      if (streamInfo && streamInfo.url) {
+        directUrl = streamInfo.url;
+        mimeType = streamInfo.mimeType;
       }
     }
 
+    // إذا لم تتوفر صيغة مباشرة، نمنع إرسال HLS نهائياً لتفادي الانهيار
     if (!directUrl) {
-      return res.status(404).json({ error: 'لم يتم العثور على الرابط المباشر' });
+      return res.status(404).json({ error: 'عذراً، هذه الأغنية لا توفر صيغة صوت مباشرة متوافقة' });
     }
 
     // =====================================================
-    // ✅ الوضع 1: معلومات فقط (JSON) — نُعيد الرابط المباشر
+    // ✅ وضع المعلمات (معلومات الرابط فقط)
     // =====================================================
     if (req.query.info === 'true') {
       res.setHeader('Cache-Control', 's-maxage=1200, stale-while-revalidate=300');
-      
-      // ✅ أعِد الرابط المباشر من SoundCloud (وليس proxy)
       return res.status(200).json({ 
         success: true, 
-        direct_url: directUrl,  // ← ✅ الرابط المباشر الفعلي!
-        protocol: protocol       // progressive أو hls (للتشخيص)
+        direct_url: directUrl,
+        mime_type: mimeType
       });
     }
 
     // =====================================================
-    // 🆕 الوضع 2: Proxy للصوت (يبقى للتوافق)
+    // 🔄 وضع الـ Proxy للصوت
     // =====================================================
     const range = req.headers.range || 'bytes=0-';
     
@@ -181,7 +188,7 @@ export default async function handler(req, res) {
     });
     
     if (!audioResponse.ok && audioResponse.status !== 206) {
-      return res.status(audioResponse.status).json({ error: 'فشل جلب الصوت' });
+      return res.status(audioResponse.status).json({ error: 'فشل جلب الصوت من المصدر' });
     }
     
     res.status(audioResponse.status);
@@ -207,7 +214,7 @@ export default async function handler(req, res) {
         res.write(value);
       }
     } catch (e) {
-      // connection closed by client
+      // تم قطع الاتصال من قبل العميل
     }
     
     return res.end();
@@ -215,4 +222,4 @@ export default async function handler(req, res) {
   } catch (error) {
     return res.status(500).json({ error: error.message });
   }
-                                 }
+}
