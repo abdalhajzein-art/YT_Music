@@ -33,6 +33,56 @@ async function getFreshClientId(forceRefresh = false) {
   return cachedClientId || 'iZIs9mchVcX5lhVRyQGGAYlNPVldzAoX';
 }
 
+// 🆕 دالة للحصول على رابط Progressive (MP3) بدلاً من HLS
+async function getProgressiveStreamUrl(transcodings, clientId) {
+  if (!transcodings || !Array.isArray(transcodings) || transcodings.length === 0) {
+    return null;
+  }
+
+  // 🎯 الأولوية 1: ابحث عن transcoding من نوع "progressive"
+  let progressiveTranscoding = transcodings.find(t => 
+    t.format && t.format.protocol === 'progressive'
+  );
+
+  // 🎯 الأولوية 2: إذا لم يوجد، جرب "hls" (قد لا يعمل على MediaPlayer القديم)
+  if (!progressiveTranscoding) {
+    progressiveTranscoding = transcodings.find(t => 
+      t.format && t.format.protocol === 'hls'
+    );
+  }
+
+  if (!progressiveTranscoding) {
+    return null;
+  }
+
+  // احصل على رابط الـ stream الفعلي
+  let streamApiUrl = progressiveTranscoding.url;
+  if (!streamApiUrl.includes('client_id=')) {
+    const sep = streamApiUrl.includes('?') ? '&' : '?';
+    streamApiUrl = `${streamApiUrl}${sep}client_id=${clientId}`;
+  }
+
+  try {
+    const streamRes = await fetch(streamApiUrl, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept': 'application/json'
+      }
+    });
+
+    if (!streamRes.ok) {
+      console.error('فشل جلب stream URL:', streamRes.status);
+      return null;
+    }
+
+    const streamData = await streamRes.json();
+    return streamData.url || null;
+  } catch (e) {
+    console.error('خطأ في getProgressiveStreamUrl:', e);
+    return null;
+  }
+}
+
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
@@ -82,7 +132,25 @@ export default async function handler(req, res) {
 
     const data = await response.json();
 
-    if (!data || !data.url) {
+    if (!data) {
+      return res.status(404).json({ error: 'لم يتم العثور على بيانات الأغنية' });
+    }
+
+    // =====================================================
+    // 🆕 الخطوة الأهم: احصل على رابط Progressive إن أمكن
+    // =====================================================
+    let directUrl = data.url; // افتراضي
+    let protocol = 'hls';
+
+    if (data.media && data.media.transcodings) {
+      const progressiveUrl = await getProgressiveStreamUrl(data.media.transcodings, clientId);
+      if (progressiveUrl) {
+        directUrl = progressiveUrl;
+        protocol = 'progressive';
+      }
+    }
+
+    if (!directUrl) {
       return res.status(404).json({ error: 'لم يتم العثور على الرابط المباشر' });
     }
 
@@ -90,16 +158,18 @@ export default async function handler(req, res) {
     // 🆕 الوضع 1: معلومات فقط (JSON)
     // =====================================================
     if (req.query.info === 'true') {
-      // نرجّع رابط Proxy بدل SoundCloud CDN
-      const protocol = req.headers['x-forwarded-proto'] || 'https';
+      const proto = req.headers['x-forwarded-proto'] || 'https';
       const host = req.headers.host;
-      const proxyUrl = `${protocol}://${host}/api/stream?url=${encodeURIComponent(streamUrl)}&proxy=true`;
+      
+      // 🎯 أعِد رابط Proxy يحتوي على الرابط المباشر الفعلي
+      const proxyUrl = `${proto}://${host}/api/stream?url=${encodeURIComponent(streamUrl)}&proxy=true`;
       
       res.setHeader('Cache-Control', 's-maxage=1200, stale-while-revalidate=300');
       
       return res.status(200).json({ 
         success: true, 
-        direct_url: proxyUrl
+        direct_url: proxyUrl,
+        protocol: protocol // hls أو progressive (للتشخيص)
       });
     }
 
@@ -108,7 +178,7 @@ export default async function handler(req, res) {
     // =====================================================
     const range = req.headers.range || 'bytes=0-';
     
-    const audioResponse = await fetch(data.url, {
+    const audioResponse = await fetch(directUrl, {
       headers: {
         'Range': range,
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
