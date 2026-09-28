@@ -33,36 +33,25 @@ async function getFreshClientId(forceRefresh = false) {
   return cachedClientId || 'iZIs9mchVcX5lhVRyQGGAYlNPVldzAoX';
 }
 
-// 🆕 دالة ذكية للبحث عن أفضل صيغة صوت مباشرة مدعومة (MP3, AAC وغيرها) وتجنب HLS
-async function getBestProgressiveStreamUrl(transcodings, clientId) {
+// 🆕 اختيار طريقة البث (تفضيل Progressive أولاً، وإذا لم يتوفر نأخذ HLS لتحويله)
+async function getBestStreamUrl(transcodings, clientId) {
   if (!transcodings || !Array.isArray(transcodings) || transcodings.length === 0) {
     return null;
   }
 
-  // تصفية جميع الـ transcodings التي تعتمد على الـ progressive فقط (مستبعدين HLS تماماً)
-  const progressiveOptions = transcodings.filter(t => 
+  let selectedTranscoding = transcodings.find(t => 
     t.format && t.format.protocol === 'progressive'
   );
 
-  if (progressiveOptions.length === 0) {
-    return null;
+  if (!selectedTranscoding) {
+    selectedTranscoding = transcodings.find(t => 
+      t.format && t.format.protocol === 'hls'
+    );
   }
 
-  // نرتب الأولوية للصيغ التي يفهمهاMediaPlayer بكفاءة عالية (MP3 أولاً، ثم AAC/M4A، ثم أي صيغة progressive أخرى)
-  progressiveOptions.sort((a, b) => {
-    const mimeA = (a.format.mime_type || '').toLowerCase();
-    const mimeB = (b.format.mime_type || '').toLowerCase();
-    
-    if (mimeA.includes('mpeg') || mimeA.includes('mp3')) return -1;
-    if (mimeB.includes('mpeg') || mimeB.includes('mp3')) return 1;
-    if (mimeA.includes('aac') || mimeA.includes('mp4')) return -1;
-    if (mimeB.includes('aac') || mimeB.includes('mp4')) return 1;
-    return 0;
-  });
+  if (!selectedTranscoding) return null;
 
-  const bestTranscoding = progressiveOptions[0];
-  let streamApiUrl = bestTranscoding.url;
-  
+  let streamApiUrl = selectedTranscoding.url;
   if (!streamApiUrl.includes('client_id=')) {
     const sep = streamApiUrl.includes('?') ? '&' : '?';
     streamApiUrl = `${streamApiUrl}${sep}client_id=${clientId}`;
@@ -76,18 +65,72 @@ async function getBestProgressiveStreamUrl(transcodings, clientId) {
       }
     });
 
-    if (!streamRes.ok) {
-      return null;
-    }
+    if (!streamRes.ok) return null;
 
     const streamData = await streamRes.json();
     return {
       url: streamData.url || null,
-      mimeType: bestTranscoding.format.mime_type || 'audio/mpeg'
+      isHls: selectedTranscoding.format.protocol === 'hls'
     };
   } catch (e) {
-    console.error('خطأ في جلب الرابط المباشر:', e);
+    console.error('خطأ في جلب رابط الصوت:', e);
     return null;
+  }
+}
+
+// 🔗 دالة تحويل بث الـ HLS إلى ملف MP3 متصل فورياً مشغل الأندرويد يفهمه
+async function streamHlsAsMp3(playlistUrl, res) {
+  try {
+    const manifestRes = await fetch(playlistUrl, {
+      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' }
+    });
+    
+    if (!manifestRes.ok) {
+      return res.status(500).json({ error: 'فشل قراءة قائمة HLS' });
+    }
+
+    const manifestText = await manifestRes.text();
+    
+    // استخراج روابط المقاطع الصوتية (.ts / .mp3 / .aac) من ملف m3u8
+    const lines = manifestText.split('\n');
+    const segmentUrls = lines
+      .map(l => l.trim())
+      .filter(l => l && !l.startsWith('#'));
+
+    if (segmentUrls.length === 0) {
+      return res.status(404).json({ error: 'لم يتم العثور على مقاطع صوتية في القائمة' });
+    }
+
+    // إيهام المشغل بأنه بث MP3 مباشر عادي
+    res.setHeader('Content-Type', 'audio/mpeg');
+    res.setHeader('Transfer-Encoding', 'chunked');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.status(200);
+
+    // جلب المقاطع بالترتيب وضخ بياناتها مباشرة للتطبيق
+    for (const segmentUrl of segmentUrls) {
+      if (res.writableEnded || res.destroyed) break;
+
+      try {
+        const segRes = await fetch(segmentUrl, {
+          headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' }
+        });
+        
+        if (segRes.ok) {
+          const arrayBuffer = await segRes.arrayBuffer();
+          res.write(Buffer.from(arrayBuffer));
+        }
+      } catch (err) {
+        console.error('خطأ في جلب المقطع:', err);
+      }
+    }
+
+    return res.end();
+  } catch (e) {
+    console.error('خطأ أثناء تحويل HLS:', e);
+    if (!res.headersSent) {
+      return res.status(500).json({ error: 'خطأ في معالجة الصوت' });
+    }
   }
 }
 
@@ -116,7 +159,7 @@ export default async function handler(req, res) {
     
     let response = await fetch(soundcloudUrl, {
       headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
         'Accept': 'application/json, text/javascript, */*; q=0.01'
       }
     });
@@ -144,40 +187,37 @@ export default async function handler(req, res) {
       return res.status(404).json({ error: 'لم يتم العثور على بيانات الأغنية' });
     }
 
-    // =====================================================
-    // 🎯 جلب أفضل صيغة مباشرة (تفضيل MP3/AAC واستبعاد HLS)
-    // =====================================================
     let directUrl = null;
-    let mimeType = 'audio/mpeg';
+    let isHls = false;
 
     if (data.media && data.media.transcodings) {
-      const streamInfo = await getBestProgressiveStreamUrl(data.media.transcodings, clientId);
+      const streamInfo = await getBestStreamUrl(data.media.transcodings, clientId);
       if (streamInfo && streamInfo.url) {
         directUrl = streamInfo.url;
-        mimeType = streamInfo.mimeType;
+        isHls = streamInfo.isHls;
       }
     }
 
-    // إذا لم تتوفر صيغة مباشرة، نمنع إرسال HLS نهائياً لتفادي الانهيار
     if (!directUrl) {
-      return res.status(404).json({ error: 'عذراً، هذه الأغنية لا توفر صيغة صوت مباشرة متوافقة' });
+      return res.status(404).json({ error: 'عذراً، لا يتوفر مصدر صوت لهذه الأغنية' });
     }
 
-    // =====================================================
-    // ✅ وضع المعلمات (معلومات الرابط فقط)
-    // =====================================================
+    // 🎯 معلومات الرابط للتطبيق (يُنظر إليها دائماً على أنها MP3)
     if (req.query.info === 'true') {
       res.setHeader('Cache-Control', 's-maxage=1200, stale-while-revalidate=300');
       return res.status(200).json({ 
         success: true, 
-        direct_url: directUrl,
-        mime_type: mimeType
+        direct_url: req.headers.host ? `https://${req.headers.host}/api/stream?url=${encodeURIComponent(streamUrl)}` : directUrl,
+        mime_type: 'audio/mpeg'
       });
     }
 
-    // =====================================================
-    // 🔄 وضع الـ Proxy للصوت
-    // =====================================================
+    // ⚡ إذا كان المصدر HLS، السيرفر يقوم بدمج أجزائه وإرسالها كـ MP3 حي للمشغل
+    if (isHls) {
+      return await streamHlsAsMp3(directUrl, res);
+    }
+
+    // 🔄 إذا كان المصدر MP3 مباشر من الأصل
     const range = req.headers.range || 'bytes=0-';
     
     const audioResponse = await fetch(directUrl, {
@@ -214,7 +254,7 @@ export default async function handler(req, res) {
         res.write(value);
       }
     } catch (e) {
-      // تم قطع الاتصال من قبل العميل
+      // قطع الاتصال
     }
     
     return res.end();
