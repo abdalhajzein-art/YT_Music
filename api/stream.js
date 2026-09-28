@@ -44,7 +44,7 @@ async function getProgressiveStreamUrl(transcodings, clientId) {
     t.format && t.format.protocol === 'progressive'
   );
 
-  // 🎯 الأولوية 2: إذا لم يوجد، جرب "hls" (قد لا يعمل على MediaPlayer القديم)
+  // 🎯 الأولوية 2: إذا لم يوجد، جرب "hls"
   if (!progressiveTranscoding) {
     progressiveTranscoding = transcodings.find(t => 
       t.format && t.format.protocol === 'hls'
@@ -137,7 +137,7 @@ export default async function handler(req, res) {
     }
 
     // =====================================================
-    // 🆕 الخطوة الأهم: احصل على رابط Progressive إن أمكن
+    // 🆕 احصل على رابط Progressive إن أمكن
     // =====================================================
     let directUrl = data.url; // افتراضي
     let protocol = 'hls';
@@ -155,26 +155,21 @@ export default async function handler(req, res) {
     }
 
     // =====================================================
-    // 🆕 الوضع 1: معلومات فقط (JSON)
+    // ✅ الوضع 1: معلومات فقط (JSON) — نُعيد الرابط المباشر
     // =====================================================
     if (req.query.info === 'true') {
-      const proto = req.headers['x-forwarded-proto'] || 'https';
-      const host = req.headers.host;
-      
-      // 🎯 أعِد رابط Proxy يحتوي على الرابط المباشر الفعلي
-      const proxyUrl = `${proto}://${host}/api/stream?url=${encodeURIComponent(streamUrl)}&proxy=true`;
-      
       res.setHeader('Cache-Control', 's-maxage=1200, stale-while-revalidate=300');
       
+      // ✅ أعِد الرابط المباشر من SoundCloud (وليس proxy)
       return res.status(200).json({ 
         success: true, 
-        direct_url: proxyUrl,
-        protocol: protocol // hls أو progressive (للتشخيص)
+        direct_url: directUrl,  // ← ✅ الرابط المباشر الفعلي!
+        protocol: protocol       // progressive أو hls (للتشخيص)
       });
     }
 
     // =====================================================
-    // 🆕 الوضع 2: Proxy للصوت (default)
+    // 🆕 الوضع 2: Proxy للصوت (يبقى للتوافق)
     // =====================================================
     const range = req.headers.range || 'bytes=0-';
     
@@ -220,4 +215,4 @@ export default async function handler(req, res) {
   } catch (error) {
     return res.status(500).json({ error: error.message });
   }
-        }
+                                 }
