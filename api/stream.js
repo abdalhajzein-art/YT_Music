@@ -33,16 +33,18 @@ async function getFreshClientId(forceRefresh = false) {
   return cachedClientId || 'iZIs9mchVcX5lhVRyQGGAYlNPVldzAoX';
 }
 
-// 🆕 اختيار طريقة البث (تفضيل Progressive أولاً، وإذا لم يتوفر نأخذ HLS لتحويله)
+// 🆕 اختيار طريقة البث (تفضيل Progressive أولاً، وإذا لم يتوفر نأخذ HLS)
 async function getBestStreamUrl(transcodings, clientId) {
   if (!transcodings || !Array.isArray(transcodings) || transcodings.length === 0) {
     return null;
   }
 
+  // تفضيل progressive
   let selectedTranscoding = transcodings.find(t => 
     t.format && t.format.protocol === 'progressive'
   );
 
+  // إذا لم يوجد، نأخذ hls
   if (!selectedTranscoding) {
     selectedTranscoding = transcodings.find(t => 
       t.format && t.format.protocol === 'hls'
@@ -78,7 +80,7 @@ async function getBestStreamUrl(transcodings, clientId) {
   }
 }
 
-// 🔗 دالة تحويل بث الـ HLS إلى ملف MP3 متصل فورياً مشغل الأندرويد يفهمه
+// 🔗 دالة تحويل بث الـ HLS إلى ملف MP3 متصل فورياً (احتياطية)
 async function streamHlsAsMp3(playlistUrl, res) {
   try {
     const manifestRes = await fetch(playlistUrl, {
@@ -91,7 +93,6 @@ async function streamHlsAsMp3(playlistUrl, res) {
 
     const manifestText = await manifestRes.text();
     
-    // استخراج روابط المقاطع الصوتية (.ts / .mp3 / .aac) من ملف m3u8
     const lines = manifestText.split('\n');
     const segmentUrls = lines
       .map(l => l.trim())
@@ -101,13 +102,11 @@ async function streamHlsAsMp3(playlistUrl, res) {
       return res.status(404).json({ error: 'لم يتم العثور على مقاطع صوتية في القائمة' });
     }
 
-    // إيهام المشغل بأنه بث MP3 مباشر عادي
     res.setHeader('Content-Type', 'audio/mpeg');
     res.setHeader('Transfer-Encoding', 'chunked');
     res.setHeader('Cache-Control', 'no-cache');
     res.status(200);
 
-    // جلب المقاطع بالترتيب وضخ بياناتها مباشرة للتطبيق
     for (const segmentUrl of segmentUrls) {
       if (res.writableEnded || res.destroyed) break;
 
@@ -202,22 +201,30 @@ export default async function handler(req, res) {
       return res.status(404).json({ error: 'عذراً، لا يتوفر مصدر صوت لهذه الأغنية' });
     }
 
-    // 🎯 معلومات الرابط للتطبيق (يُنظر إليها دائماً على أنها MP3)
+    // ═══════════════════════════════════════════════════════════
+    // ✅ الوضع 1: معلومات فقط — نُعيد الرابط المباشر من SoundCloud
+    // ═══════════════════════════════════════════════════════════
     if (req.query.info === 'true') {
       res.setHeader('Cache-Control', 's-maxage=1200, stale-while-revalidate=300');
+      
       return res.status(200).json({ 
         success: true, 
-        direct_url: req.headers.host ? `https://${req.headers.host}/api/stream?url=${encodeURIComponent(streamUrl)}` : directUrl,
-        mime_type: 'audio/mpeg'
+        direct_url: directUrl,
+        protocol: isHls ? 'hls' : 'progressive',
+        mime_type: isHls ? 'application/vnd.apple.mpegurl' : 'audio/mpeg'
       });
     }
 
-    // ⚡ إذا كان المصدر HLS، السيرفر يقوم بدمج أجزائه وإرسالها كـ MP3 حي للمشغل
+    // ═══════════════════════════════════════════════════════════
+    // ⚡ الوضع 2: بث HLS — تحويل المقاطع إلى MP3 حي (احتياطي)
+    // ═══════════════════════════════════════════════════════════
     if (isHls) {
       return await streamHlsAsMp3(directUrl, res);
     }
 
-    // 🔄 إذا كان المصدر MP3 مباشر من الأصل
+    // ═══════════════════════════════════════════════════════════
+    // 🔄 الوضع 3: بث MP3 مباشر — Proxy عادي
+    // ═══════════════════════════════════════════════════════════
     const range = req.headers.range || 'bytes=0-';
     
     const audioResponse = await fetch(directUrl, {
@@ -262,4 +269,4 @@ export default async function handler(req, res) {
   } catch (error) {
     return res.status(500).json({ error: error.message });
   }
-}
+  }
