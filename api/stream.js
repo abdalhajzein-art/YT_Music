@@ -39,12 +39,10 @@ async function getBestStreamUrl(transcodings, clientId) {
     return null;
   }
 
-  // تفضيل progressive
   let selectedTranscoding = transcodings.find(t => 
     t.format && t.format.protocol === 'progressive'
   );
 
-  // إذا لم يوجد، نأخذ hls
   if (!selectedTranscoding) {
     selectedTranscoding = transcodings.find(t => 
       t.format && t.format.protocol === 'hls'
@@ -77,59 +75,6 @@ async function getBestStreamUrl(transcodings, clientId) {
   } catch (e) {
     console.error('خطأ في جلب رابط الصوت:', e);
     return null;
-  }
-}
-
-// 🔗 دالة تحويل بث الـ HLS إلى ملف MP3 متصل فورياً (احتياطية)
-async function streamHlsAsMp3(playlistUrl, res) {
-  try {
-    const manifestRes = await fetch(playlistUrl, {
-      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' }
-    });
-    
-    if (!manifestRes.ok) {
-      return res.status(500).json({ error: 'فشل قراءة قائمة HLS' });
-    }
-
-    const manifestText = await manifestRes.text();
-    
-    const lines = manifestText.split('\n');
-    const segmentUrls = lines
-      .map(l => l.trim())
-      .filter(l => l && !l.startsWith('#'));
-
-    if (segmentUrls.length === 0) {
-      return res.status(404).json({ error: 'لم يتم العثور على مقاطع صوتية في القائمة' });
-    }
-
-    res.setHeader('Content-Type', 'audio/mpeg');
-    res.setHeader('Transfer-Encoding', 'chunked');
-    res.setHeader('Cache-Control', 'no-cache');
-    res.status(200);
-
-    for (const segmentUrl of segmentUrls) {
-      if (res.writableEnded || res.destroyed) break;
-
-      try {
-        const segRes = await fetch(segmentUrl, {
-          headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' }
-        });
-        
-        if (segRes.ok) {
-          const arrayBuffer = await segRes.arrayBuffer();
-          res.write(Buffer.from(arrayBuffer));
-        }
-      } catch (err) {
-        console.error('خطأ في جلب المقطع:', err);
-      }
-    }
-
-    return res.end();
-  } catch (e) {
-    console.error('خطأ أثناء تحويل HLS:', e);
-    if (!res.headersSent) {
-      return res.status(500).json({ error: 'خطأ في معالجة الصوت' });
-    }
   }
 }
 
@@ -202,35 +147,35 @@ export default async function handler(req, res) {
     }
 
     // ═══════════════════════════════════════════════════════════
-    // ✅ الوضع 1: معلومات فقط — نُعيد الرابط المباشر من SoundCloud
+    // ✅ وضع info=true: نُعيد رابط Vercel Proxy (لأن SoundCloud يرفض الوصول المباشر)
     // ═══════════════════════════════════════════════════════════
     if (req.query.info === 'true') {
+      const proto = req.headers['x-forwarded-proto'] || 'https';
+      const host = req.headers.host;
+      const proxyUrl = `${proto}://${host}/api/stream?url=${encodeURIComponent(streamUrl)}&proxy=true`;
+      
       res.setHeader('Cache-Control', 's-maxage=1200, stale-while-revalidate=300');
       
       return res.status(200).json({ 
         success: true, 
-        direct_url: directUrl,
+        direct_url: proxyUrl,
         protocol: isHls ? 'hls' : 'progressive',
         mime_type: isHls ? 'application/vnd.apple.mpegurl' : 'audio/mpeg'
       });
     }
 
     // ═══════════════════════════════════════════════════════════
-    // ⚡ الوضع 2: بث HLS — تحويل المقاطع إلى MP3 حي (احتياطي)
-    // ═══════════════════════════════════════════════════════════
-    if (isHls) {
-      return await streamHlsAsMp3(directUrl, res);
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    // 🔄 الوضع 3: بث MP3 مباشر — Proxy عادي
+    // ✅ وضع proxy=true: Proxy كامل يدعم Range Requests
     // ═══════════════════════════════════════════════════════════
     const range = req.headers.range || 'bytes=0-';
     
     const audioResponse = await fetch(directUrl, {
+      method: 'GET',
       headers: {
         'Range': range,
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept': '*/*',
+        'Accept-Encoding': 'identity'
       }
     });
     
@@ -240,12 +185,14 @@ export default async function handler(req, res) {
     
     res.status(audioResponse.status);
     
-    ['content-type', 'content-length', 'content-range', 'accept-ranges'].forEach(h => {
+    // نمرر الـ headers المهمة
+    ['content-type', 'content-length', 'content-range', 'accept-ranges', 'last-modified', 'etag'].forEach(h => {
       const v = audioResponse.headers.get(h);
       if (v) res.setHeader(h, v);
     });
     
     res.setHeader('Cache-Control', 'public, max-age=3600');
+    res.setHeader('Access-Control-Allow-Origin', '*');
     
     const reader = audioResponse.body.getReader();
     let closed = false;
@@ -269,4 +216,4 @@ export default async function handler(req, res) {
   } catch (error) {
     return res.status(500).json({ error: error.message });
   }
-  }
+                  }
