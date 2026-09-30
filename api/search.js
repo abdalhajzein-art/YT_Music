@@ -43,12 +43,13 @@ function shuffleArray(array) {
 
 const OPUS_PRIORITY = ['opus_0_2', 'opus_0_1', 'opus_0_0'];
 
+// 🖼️ صور بحجم 500x500 (الوحيد المتوفر في SoundCloud)
 function getHighQualityArtwork(artworkUrl) {
   if (!artworkUrl) return null;
   const baseUrl = artworkUrl.replace(/-(t\d+x\d+|large|small|tiny|mini|crop|badge|original)(\.\w+)?$/i, '');
   const extMatch = artworkUrl.match(/\.(jpg|jpeg|png|webp)$/i);
   const ext = extMatch ? extMatch[1] : 'jpg';
-  return `${baseUrl}-t400x400.${ext}`;
+  return `${baseUrl}-t500x500.${ext}`;
 }
 
 export default async function handler(req, res) {
@@ -98,7 +99,7 @@ export default async function handler(req, res) {
       return res.status(404).json({ error: 'لم يتم العثور على نتائج' });
     }
 
-    // 🔑 بناء رابط proxy
+    // 🔑 proto و host
     const proto = req.headers['x-forwarded-proto'] || 'https';
     const host = req.headers.host;
 
@@ -125,7 +126,7 @@ export default async function handler(req, res) {
         transcoding = transcodings.find(t => t.format?.protocol === 'progressive');
       }
 
-      // 4. HLS fallback
+      // 4. HLS
       if (!transcoding) {
         transcoding = transcodings.find(t => t.format?.protocol === 'hls');
       }
@@ -135,7 +136,7 @@ export default async function handler(req, res) {
         transcoding = transcodings[0];
       }
 
-      // 🔑 رابط proxy جاهز للتشغيل
+      // 🔑 رابط proxy
       let streamEndpoint = null;
       if (transcoding) {
         streamEndpoint = `${proto}://${host}/api/stream?url=${encodeURIComponent(transcoding.url)}&proxy=true`;
@@ -149,7 +150,7 @@ export default async function handler(req, res) {
         artist: track.user?.username || 'مجهول',
         duration: track.duration,
         artwork: artwork,
-        stream_endpoint: streamEndpoint  // ✅ رابط proxy
+        stream_endpoint: streamEndpoint
       };
     }).filter(t => t.stream_endpoint !== null);
 
@@ -165,4 +166,4 @@ export default async function handler(req, res) {
   } catch (error) {
     return res.status(500).json({ error: error.message });
   }
-      }
+                                 }
