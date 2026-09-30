@@ -1,9 +1,8 @@
-// 🧠 ذاكرة مؤقتة لـ Client ID لتجنب الفحص وإبطاء السيرفر مع كل طلب
+// 🧠 ذاكرة مؤقتة لـ Client ID
 let cachedClientId = null;
 let lastFetchTime = 0;
-const CACHE_DURATION = 2 * 60 * 60 * 1000; // ساعتان
+const CACHE_DURATION = 2 * 60 * 60 * 1000;
 
-// دالة جلب Client ID طازج (مع تخزين مؤقت)
 async function getFreshClientId(forceRefresh = false) {
   const now = Date.now();
   if (!forceRefresh && cachedClientId && (now - lastFetchTime < CACHE_DURATION)) {
@@ -16,7 +15,7 @@ async function getFreshClientId(forceRefresh = false) {
     });
     const html = await htmlRes.text();
     const scriptUrls = [...html.matchAll(/src="(https:\/\/[^"]+\.js)"/g)].map(m => m[1]);
-    
+
     for (const scriptUrl of scriptUrls.slice(-6)) {
       const scriptRes = await fetch(scriptUrl);
       const scriptText = await scriptRes.text();
@@ -28,13 +27,12 @@ async function getFreshClientId(forceRefresh = false) {
       }
     }
   } catch (e) {
-    console.error('فشل جلب Client ID جديد:', e);
+    console.error('فشل جلب Client ID:', e);
   }
 
   return cachedClientId || 'iZIs9mchVcX5lhVRyQGGAYlNPVldzAoX';
 }
 
-// 🎲 دالة خلط النتائج عشوائياً
 function shuffleArray(array) {
   for (let i = array.length - 1; i > 0; i--) {
     const j = Math.floor(Math.random() * (i + 1));
@@ -43,33 +41,19 @@ function shuffleArray(array) {
   return array;
 }
 
-// 🎯 أولويات Opus presets (128 kbps = الأفضل توازناً)
-const OPUS_PRIORITY = [
-  'opus_0_2',   // 128 kbps
-  'opus_0_1',   // 96 kbps
-  'opus_0_0',   // 64 kbps
-];
+const OPUS_PRIORITY = ['opus_0_2', 'opus_0_1', 'opus_0_0'];
 
-// 🖼️ دالة تحويل رابط الصورة إلى أعلى جودة متوفرة
 function getHighQualityArtwork(artworkUrl) {
   if (!artworkUrl) return null;
-  
-  // 1) إزالة أي حجم موجود في الرابط (-large, -t500x500, -small, -tiny, -original, إلخ)
   const baseUrl = artworkUrl.replace(/-(t\d+x\d+|large|small|tiny|mini|crop|badge|original)(\.\w+)?$/i, '');
-  
-  // 2) استخراج الامتداد (jpg, png, webp)
   const extMatch = artworkUrl.match(/\.(jpg|jpeg|png|webp)$/i);
   const ext = extMatch ? extMatch[1] : 'jpg';
-  
-  // 3) إضافة -t500x500 (500×500) — الأفضل توازناً بين الجودة والحجم
-  return `${baseUrl}-t500x500.${ext}`;
+  return `${baseUrl}-t400x400.${ext}`;
 }
 
 export default async function handler(req, res) {
-  // 🌐 CORS
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET');
-  // 🆕 Cache للبحث على Vercel Edge: 5 دقائق
   res.setHeader('Cache-Control', 's-maxage=300, stale-while-revalidate=600');
 
   const query = req.query.q;
@@ -83,7 +67,7 @@ export default async function handler(req, res) {
   try {
     let clientId = await getFreshClientId();
     let searchUrl = `https://api-v2.soundcloud.com/search/tracks?q=${encodeURIComponent(query)}&client_id=${clientId}&limit=${limit}&offset=${offset}`;
-    
+
     let searchResponse = await fetch(searchUrl, {
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -91,7 +75,6 @@ export default async function handler(req, res) {
       }
     });
 
-    // 🔄 تجديد Client ID تلقائياً إذا كان منتهياً
     if (searchResponse.status === 401 || searchResponse.status === 403) {
       clientId = await getFreshClientId(true);
       searchUrl = `https://api-v2.soundcloud.com/search/tracks?q=${encodeURIComponent(query)}&client_id=${clientId}&limit=${limit}&offset=${offset}`;
@@ -104,46 +87,60 @@ export default async function handler(req, res) {
     }
 
     if (!searchResponse.ok) {
-      return res.status(searchResponse.status).json({ 
-        error: `SoundCloud API Error: ${searchResponse.statusText}` 
+      return res.status(searchResponse.status).json({
+        error: `SoundCloud API Error: ${searchResponse.statusText}`
       });
     }
 
     const searchData = await searchResponse.json();
 
     if (!searchData.collection || searchData.collection.length === 0) {
-      return res.status(404).json({ error: 'لم يتم العثور على نتائج إضافية' });
+      return res.status(404).json({ error: 'لم يتم العثور على نتائج' });
     }
+
+    // 🔑 بناء رابط proxy
+    const proto = req.headers['x-forwarded-proto'] || 'https';
+    const host = req.headers.host;
 
     let tracks = searchData.collection.map(track => {
       const transcodings = track.media?.transcodings || [];
 
-      // 🎯 1. البحث عن Opus بالأولوية (128 kbps أولاً)
+      // 1. Opus بأولوية
       let transcoding = null;
       for (const preset of OPUS_PRIORITY) {
         transcoding = transcodings.find(t => t.preset && t.preset.includes(preset));
         if (transcoding) break;
       }
 
-      // 🎯 2. أي Opus متوفر
+      // 2. أي Opus
       if (!transcoding) {
-        transcoding = transcodings.find(t => 
-          (t.preset && t.preset.includes('opus')) || 
+        transcoding = transcodings.find(t =>
+          (t.preset && t.preset.includes('opus')) ||
           (t.format && t.format.mime_type && t.format.mime_type.includes('opus'))
         );
       }
 
-      // 🔄 3. احتياطي: Progressive MP3
+      // 3. Progressive MP3
       if (!transcoding) {
         transcoding = transcodings.find(t => t.format?.protocol === 'progressive');
       }
 
-      // 🔄 4. احتياطي أخير
+      // 4. HLS fallback
+      if (!transcoding) {
+        transcoding = transcodings.find(t => t.format?.protocol === 'hls');
+      }
+
+      // 5. أي شيء
       if (!transcoding && transcodings.length > 0) {
         transcoding = transcodings[0];
       }
 
-      // 🖼️ تحويل الصورة إلى -t500x500 (500×500) لجودة عالية
+      // 🔑 رابط proxy جاهز للتشغيل
+      let streamEndpoint = null;
+      if (transcoding) {
+        streamEndpoint = `${proto}://${host}/api/stream?url=${encodeURIComponent(transcoding.url)}&proxy=true`;
+      }
+
       const artwork = getHighQualityArtwork(track.artwork_url);
 
       return {
@@ -152,22 +149,20 @@ export default async function handler(req, res) {
         artist: track.user?.username || 'مجهول',
         duration: track.duration,
         artwork: artwork,
-        // 🆕 بدون client_id — stream.js سيضيفه طازجاً
-        stream_endpoint: transcoding ? transcoding.url : null
+        stream_endpoint: streamEndpoint  // ✅ رابط proxy
       };
     }).filter(t => t.stream_endpoint !== null);
 
-    // 🎲 خلط النتائج
     tracks = shuffleArray(tracks);
 
-    return res.status(200).json({ 
-      success: true, 
+    return res.status(200).json({
+      success: true,
       offset: Number(offset),
       count: tracks.length,
-      tracks: tracks 
+      tracks: tracks
     });
 
   } catch (error) {
     return res.status(500).json({ error: error.message });
   }
-     }
+      }
