@@ -191,14 +191,11 @@ async function extractDirectUrl(apiUrl, clientId) {
 
   const data = await response.json();
 
-  // الحالة 1: data.url مباشر
   if (data && data.url) {
-    // ⚠️ مهم: نتحقق إذا كان الرابط m3u8
     const isHls = data.url.includes('.m3u8') || data.url.includes('/hls/') || data.url.includes('playlist');
     return { url: data.url, isHls: isHls };
   }
 
-  // الحالة 2: data.media.transcodings
   if (data && data.media && data.media.transcodings) {
     let selected = data.media.transcodings.find(t => t.format?.protocol === 'progressive');
     if (!selected) {
@@ -222,7 +219,7 @@ async function extractDirectUrl(apiUrl, clientId) {
     if (!streamRes.ok) return { url: null, isHls: false };
 
     const streamData = await streamRes.json();
-    const isHls = selected.format.protocol === 'hls';
+    const isHls = selected.format.protocol === 'hls' || (streamData.url && (streamData.url.includes('.m3u8') || streamData.url.includes('/hls/')));
     return {
       url: streamData.url || null,
       isHls: isHls
@@ -238,9 +235,7 @@ async function handleStream(req, res) {
     return res.status(400).json({ error: 'missing url' });
   }
 
-  // ═══════════════════════════════════════════════════════════
   // 🎯 proxy_ts Mode: تمرير أقسام .ts + init.mp4 مباشرة
-  // ═══════════════════════════════════════════════════════════
   if (req.query.proxy_ts === 'true') {
     const range = req.headers.range || 'bytes=0-';
 
@@ -306,7 +301,7 @@ async function handleStream(req, res) {
   const isHls = result.isHls;
 
   // ═══════════════════════════════════════════════════════════
-  // 🎯 HLS Mode: أعد كتابة m3u8 ليمر كل قسم عبر proxy
+  // 🎯 HLS Mode: إعادة كتابة m3u8 بدقة للروابط النسبية والقوائم الفرعية
   // ═══════════════════════════════════════════════════════════
   if (isHls) {
     try {
@@ -322,53 +317,44 @@ async function handleStream(req, res) {
       }
 
       const m3u8Content = await m3u8Res.text();
-
       const proto = req.headers['x-forwarded-proto'] || 'https';
       const host = req.headers.host;
-      const baseProxyUrl = `${proto}://${host}/api/search?action=stream&proxy_ts=true&url=`;
+      const parsedBaseUrl = new URL(directUrl);
 
-      // استخراج base للروابط النسبية
-      const baseDir = directUrl.substring(0, directUrl.lastIndexOf('/'));
+      const makeProxyUrl = (targetUrl) => {
+        const isSubM3u8 = targetUrl.includes('.m3u8');
+        const actionParam = isSubM3u8 ? 'stream' : 'stream&proxy_ts=true';
+        return `${proto}://${host}/api/search?action=${actionParam}&url=${encodeURIComponent(targetUrl)}`;
+      };
 
-      // ═══ إعادة كتابة m3u8 ═══
       let rewritten = m3u8Content.split('\n').map(line => {
         const trimmed = line.trim();
 
-        // #EXT-X-MAP:URI="..."
         if (trimmed.startsWith('#EXT-X-MAP:URI="')) {
           const match = trimmed.match(/#EXT-X-MAP:URI="([^"]+)"/);
           if (match) {
-            const absoluteUrl = match[1];
-            const proxyUrl = `${baseProxyUrl}${encodeURIComponent(absoluteUrl)}`;
-            return `#EXT-X-MAP:URI="${proxyUrl}"`;
+            const absoluteUrl = new URL(match[1], parsedBaseUrl.href).href;
+            return `#EXT-X-MAP:URI="${makeProxyUrl(absoluteUrl)}"`;
           }
         }
 
-        // #EXT-X-KEY:URI="..." (اختياري)
         if (trimmed.startsWith('#EXT-X-KEY:') && trimmed.includes('URI="')) {
           const match = trimmed.match(/URI="([^"]+)"/);
           if (match) {
-            const absoluteUrl = match[1];
-            const proxyUrl = `${baseProxyUrl}${encodeURIComponent(absoluteUrl)}`;
-            return trimmed.replace(match[1], proxyUrl);
+            const absoluteUrl = new URL(match[1], parsedBaseUrl.href).href;
+            return trimmed.replace(match[1], makeProxyUrl(absoluteUrl));
           }
         }
 
-        // سطر فارغ أو تعليق آخر
         if (!trimmed || trimmed.startsWith('#')) {
           return line;
         }
 
-        // رابط قسم (.ts, .m4s, init.mp4)
-        let absoluteUrl = trimmed;
-        if (!absoluteUrl.startsWith('http')) {
-          absoluteUrl = `${baseDir}/${absoluteUrl}`;
-        }
-
-        return `${baseProxyUrl}${encodeURIComponent(absoluteUrl)}`;
+        const absoluteUrl = new URL(trimmed, parsedBaseUrl.href).href;
+        return makeProxyUrl(absoluteUrl);
       }).join('\n');
 
-      res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+      res.setHeader('Content-Type', 'application/x-mpegURL');
       res.setHeader('Cache-Control', 'public, max-age=300');
       res.setHeader('Access-Control-Allow-Origin', '*');
 
@@ -382,8 +368,6 @@ async function handleStream(req, res) {
   // ═══════════════════════════════════════════════════════════
   // 🎵 Progressive Mode
   // ═══════════════════════════════════════════════════════════
-
-  // info mode
   if (req.query.info === 'true') {
     const proto = req.headers['x-forwarded-proto'] || 'https';
     const host = req.headers.host;
@@ -398,7 +382,6 @@ async function handleStream(req, res) {
     });
   }
 
-  // proxy mode
   const range = req.headers.range || 'bytes=0-';
 
   const audioResponse = await fetch(directUrl, {
@@ -487,21 +470,18 @@ export default async function handler(req, res) {
   const action = req.query.action;
 
   try {
-    // 🖼️ Proxy الصور
     if (action === 'image') {
       return await handleImage(req, res);
     }
 
-    // 🎵 Proxy الصوت
     if (action === 'stream') {
       return await handleStream(req, res);
     }
 
-    // 🔍 البحث (افتراضي)
     res.setHeader('Cache-Control', 's-maxage=300, stale-while-revalidate=600');
     return await handleSearch(req, res);
 
   } catch (error) {
     return res.status(500).json({ error: error.message });
   }
-        }
+}
