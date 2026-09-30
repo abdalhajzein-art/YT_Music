@@ -1,4 +1,10 @@
-// 🧠 ذاكرة مؤقتة لـ Client ID
+// ═══════════════════════════════════════════════════════════
+// 🎯 YT Music API - All-in-One
+//    - ?q=...                     → البحث
+//    - ?action=stream&url=...     → الصوت
+//    - ?action=image&url=...      → الصور
+// ═══════════════════════════════════════════════════════════
+
 let cachedClientId = null;
 let lastFetchTime = 0;
 const CACHE_DURATION = 2 * 60 * 60 * 1000;
@@ -43,7 +49,6 @@ function shuffleArray(array) {
 
 const OPUS_PRIORITY = ['opus_0_2', 'opus_0_1', 'opus_0_0'];
 
-// 🖼️ صور بحجم 500x500 (الوحيد المتوفر في SoundCloud)
 function getHighQualityArtwork(artworkUrl) {
   if (!artworkUrl) return null;
   const baseUrl = artworkUrl.replace(/-(t\d+x\d+|large|small|tiny|mini|crop|badge|original)(\.\w+)?$/i, '');
@@ -52,11 +57,10 @@ function getHighQualityArtwork(artworkUrl) {
   return `${baseUrl}-t500x500.${ext}`;
 }
 
-export default async function handler(req, res) {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET');
-  res.setHeader('Cache-Control', 's-maxage=300, stale-while-revalidate=600');
-
+// ═══════════════════════════════════════════════════════════
+// 🔍 البحث
+// ═══════════════════════════════════════════════════════════
+async function handleSearch(req, res) {
   const query = req.query.q;
   const offset = req.query.offset || 0;
   const limit = req.query.limit || 30;
@@ -65,105 +69,306 @@ export default async function handler(req, res) {
     return res.status(400).json({ error: 'الرجاء إدخال كلمة البحث q' });
   }
 
-  try {
-    let clientId = await getFreshClientId();
-    let searchUrl = `https://api-v2.soundcloud.com/search/tracks?q=${encodeURIComponent(query)}&client_id=${clientId}&limit=${limit}&offset=${offset}`;
+  let clientId = await getFreshClientId();
+  let searchUrl = `https://api-v2.soundcloud.com/search/tracks?q=${encodeURIComponent(query)}&client_id=${clientId}&limit=${limit}&offset=${offset}`;
 
-    let searchResponse = await fetch(searchUrl, {
+  let searchResponse = await fetch(searchUrl, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+      'Accept': 'application/json'
+    }
+  });
+
+  if (searchResponse.status === 401 || searchResponse.status === 403) {
+    clientId = await getFreshClientId(true);
+    searchUrl = `https://api-v2.soundcloud.com/search/tracks?q=${encodeURIComponent(query)}&client_id=${clientId}&limit=${limit}&offset=${offset}`;
+    searchResponse = await fetch(searchUrl, {
       headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'application/json, text/javascript, */*; q=0.01'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept': 'application/json'
+      }
+    });
+  }
+
+  if (!searchResponse.ok) {
+    return res.status(searchResponse.status).json({
+      error: `SoundCloud API Error: ${searchResponse.statusText}`
+    });
+  }
+
+  const searchData = await searchResponse.json();
+
+  if (!searchData.collection || searchData.collection.length === 0) {
+    return res.status(404).json({ error: 'لم يتم العثور على نتائج' });
+  }
+
+  const proto = req.headers['x-forwarded-proto'] || 'https';
+  const host = req.headers.host;
+
+  let tracks = searchData.collection.map(track => {
+    const transcodings = track.media?.transcodings || [];
+
+    // 1. Opus بأولوية
+    let transcoding = null;
+    for (const preset of OPUS_PRIORITY) {
+      transcoding = transcodings.find(t => t.preset && t.preset.includes(preset));
+      if (transcoding) break;
+    }
+
+    // 2. أي Opus
+    if (!transcoding) {
+      transcoding = transcodings.find(t =>
+        (t.preset && t.preset.includes('opus')) ||
+        (t.format && t.format.mime_type && t.format.mime_type.includes('opus'))
+      );
+    }
+
+    // 3. Progressive MP3
+    if (!transcoding) {
+      transcoding = transcodings.find(t => t.format?.protocol === 'progressive');
+    }
+
+    // 4. HLS
+    if (!transcoding) {
+      transcoding = transcodings.find(t => t.format?.protocol === 'hls');
+    }
+
+    // 5. أي شيء
+    if (!transcoding && transcodings.length > 0) {
+      transcoding = transcodings[0];
+    }
+
+    // 🔑 رابط الصوت (proxy)
+    let streamEndpoint = null;
+    if (transcoding) {
+      streamEndpoint = `${proto}://${host}/api/search?action=stream&url=${encodeURIComponent(transcoding.url)}`;
+    }
+
+    // 🔑 رابط الصورة (proxy)
+    const rawArtwork = getHighQualityArtwork(track.artwork_url);
+    const artwork = rawArtwork
+      ? `${proto}://${host}/api/search?action=image&url=${encodeURIComponent(rawArtwork)}`
+      : null;
+
+    return {
+      id: track.id,
+      title: track.title,
+      artist: track.user?.username || 'مجهول',
+      duration: track.duration,
+      artwork: artwork,
+      stream_endpoint: streamEndpoint
+    };
+  }).filter(t => t.stream_endpoint !== null);
+
+  tracks = shuffleArray(tracks);
+
+  return res.status(200).json({
+    success: true,
+    offset: Number(offset),
+    count: tracks.length,
+    tracks: tracks
+  });
+}
+
+// ═══════════════════════════════════════════════════════════
+// 🎵 Streaming (Proxy الصوت)
+// ═══════════════════════════════════════════════════════════
+async function extractDirectUrl(apiUrl, clientId) {
+  let urlWithClient = apiUrl;
+  if (!urlWithClient.includes('client_id=')) {
+    const sep = urlWithClient.includes('?') ? '&' : '?';
+    urlWithClient = `${urlWithClient}${sep}client_id=${clientId}`;
+  }
+
+  const response = await fetch(urlWithClient, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+      'Accept': 'application/json'
+    }
+  });
+
+  if (!response.ok) return { url: null, isHls: false };
+
+  const data = await response.json();
+
+  // الحالة 1: data.url مباشر
+  if (data && data.url) {
+    return { url: data.url, isHls: false };
+  }
+
+  // الحالة 2: data.media.transcodings
+  if (data && data.media && data.media.transcodings) {
+    let selected = data.media.transcodings.find(t => t.format?.protocol === 'progressive');
+    if (!selected) {
+      selected = data.media.transcodings.find(t => t.format?.protocol === 'hls');
+    }
+    if (!selected) return { url: null, isHls: false };
+
+    let streamApiUrl = selected.url;
+    if (!streamApiUrl.includes('client_id=')) {
+      const sep = streamApiUrl.includes('?') ? '&' : '?';
+      streamApiUrl = `${streamApiUrl}${sep}client_id=${clientId}`;
+    }
+
+    const streamRes = await fetch(streamApiUrl, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept': 'application/json'
       }
     });
 
-    if (searchResponse.status === 401 || searchResponse.status === 403) {
-      clientId = await getFreshClientId(true);
-      searchUrl = `https://api-v2.soundcloud.com/search/tracks?q=${encodeURIComponent(query)}&client_id=${clientId}&limit=${limit}&offset=${offset}`;
-      searchResponse = await fetch(searchUrl, {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-          'Accept': 'application/json, text/javascript, */*; q=0.01'
-        }
-      });
-    }
+    if (!streamRes.ok) return { url: null, isHls: false };
 
-    if (!searchResponse.ok) {
-      return res.status(searchResponse.status).json({
-        error: `SoundCloud API Error: ${searchResponse.statusText}`
-      });
-    }
+    const streamData = await streamRes.json();
+    return {
+      url: streamData.url || null,
+      isHls: selected.format.protocol === 'hls'
+    };
+  }
 
-    const searchData = await searchResponse.json();
+  return { url: null, isHls: false };
+}
 
-    if (!searchData.collection || searchData.collection.length === 0) {
-      return res.status(404).json({ error: 'لم يتم العثور على نتائج' });
-    }
+async function handleStream(req, res) {
+  const streamUrl = req.query.url;
+  if (!streamUrl) {
+    return res.status(400).json({ error: 'missing url' });
+  }
 
-    // 🔑 proto و host
+  let clientId = await getFreshClientId();
+  let result = await extractDirectUrl(streamUrl, clientId);
+
+  if (!result.url) {
+    const freshId = await getFreshClientId(true);
+    result = await extractDirectUrl(streamUrl, freshId);
+  }
+
+  if (!result.url) {
+    return res.status(404).json({ error: 'لا يتوفر مصدر صوت' });
+  }
+
+  const directUrl = result.url;
+
+  // info mode
+  if (req.query.info === 'true') {
     const proto = req.headers['x-forwarded-proto'] || 'https';
     const host = req.headers.host;
+    const proxyUrl = `${proto}://${host}/api/search?action=stream&url=${encodeURIComponent(streamUrl)}`;
 
-    let tracks = searchData.collection.map(track => {
-      const transcodings = track.media?.transcodings || [];
-
-      // 1. Opus بأولوية
-      let transcoding = null;
-      for (const preset of OPUS_PRIORITY) {
-        transcoding = transcodings.find(t => t.preset && t.preset.includes(preset));
-        if (transcoding) break;
-      }
-
-      // 2. أي Opus
-      if (!transcoding) {
-        transcoding = transcodings.find(t =>
-          (t.preset && t.preset.includes('opus')) ||
-          (t.format && t.format.mime_type && t.format.mime_type.includes('opus'))
-        );
-      }
-
-      // 3. Progressive MP3
-      if (!transcoding) {
-        transcoding = transcodings.find(t => t.format?.protocol === 'progressive');
-      }
-
-      // 4. HLS
-      if (!transcoding) {
-        transcoding = transcodings.find(t => t.format?.protocol === 'hls');
-      }
-
-      // 5. أي شيء
-      if (!transcoding && transcodings.length > 0) {
-        transcoding = transcodings[0];
-      }
-
-      // 🔑 رابط proxy
-      let streamEndpoint = null;
-      if (transcoding) {
-        streamEndpoint = `${proto}://${host}/api/stream?url=${encodeURIComponent(transcoding.url)}&proxy=true`;
-      }
-
-      const artwork = getHighQualityArtwork(track.artwork_url);
-
-      return {
-        id: track.id,
-        title: track.title,
-        artist: track.user?.username || 'مجهول',
-        duration: track.duration,
-        artwork: artwork,
-        stream_endpoint: streamEndpoint
-      };
-    }).filter(t => t.stream_endpoint !== null);
-
-    tracks = shuffleArray(tracks);
-
+    res.setHeader('Cache-Control', 's-maxage=1200, stale-while-revalidate=300');
     return res.status(200).json({
       success: true,
-      offset: Number(offset),
-      count: tracks.length,
-      tracks: tracks
+      direct_url: proxyUrl,
+      protocol: result.isHls ? 'hls' : 'progressive',
+      mime_type: result.isHls ? 'application/vnd.apple.mpegurl' : 'audio/mpeg'
     });
+  }
+
+  // proxy mode
+  const range = req.headers.range || 'bytes=0-';
+
+  const audioResponse = await fetch(directUrl, {
+    method: 'GET',
+    headers: {
+      'Range': range,
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+      'Accept': '*/*',
+      'Accept-Encoding': 'identity'
+    }
+  });
+
+  if (!audioResponse.ok && audioResponse.status !== 206) {
+    return res.status(audioResponse.status).json({ error: 'فشل جلب الصوت' });
+  }
+
+  res.status(audioResponse.status);
+
+  ['content-type', 'content-length', 'content-range', 'accept-ranges', 'last-modified', 'etag'].forEach(h => {
+    const v = audioResponse.headers.get(h);
+    if (v) res.setHeader(h, v);
+  });
+
+  res.setHeader('Cache-Control', 'public, max-age=3600');
+  res.setHeader('Access-Control-Allow-Origin', '*');
+
+  const reader = audioResponse.body.getReader();
+  let closed = false;
+  res.on('close', () => {
+    closed = true;
+    reader.cancel().catch(() => {});
+  });
+
+  try {
+    while (!closed) {
+      const { done, value } = await reader.read();
+      if (done || res.writableEnded) break;
+      res.write(value);
+    }
+  } catch (e) {}
+
+  return res.end();
+}
+
+// ═══════════════════════════════════════════════════════════
+// 🖼️ Proxy الصور
+// ═══════════════════════════════════════════════════════════
+async function handleImage(req, res) {
+  const imageUrl = req.query.url;
+  if (!imageUrl) {
+    return res.status(400).json({ error: 'missing url' });
+  }
+
+  const response = await fetch(imageUrl, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+    }
+  });
+
+  if (!response.ok) {
+    return res.status(response.status).end();
+  }
+
+  // 🚀 Cache لمدة سنة
+  res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+  res.setHeader('Access-Control-Allow-Origin', '*');
+
+  const contentType = response.headers.get('content-type') || 'image/jpeg';
+  res.setHeader('Content-Type', contentType);
+
+  const arrayBuffer = await response.arrayBuffer();
+  return res.status(200).send(Buffer.from(arrayBuffer));
+}
+
+// ═══════════════════════════════════════════════════════════
+// 🚀 MAIN HANDLER
+// ═══════════════════════════════════════════════════════════
+export default async function handler(req, res) {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Range, Content-Type');
+
+  if (req.method === 'OPTIONS') {
+    return res.status(200).end();
+  }
+
+  const action = req.query.action;
+
+  try {
+    // 🖼️ Proxy الصور
+    if (action === 'image') {
+      return await handleImage(req, res);
+    }
+
+    // 🎵 Proxy الصوت
+    if (action === 'stream') {
+      return await handleStream(req, res);
+    }
+
+    // 🔍 البحث (افتراضي)
+    res.setHeader('Cache-Control', 's-maxage=300, stale-while-revalidate=600');
+    return await handleSearch(req, res);
 
   } catch (error) {
     return res.status(500).json({ error: error.message });
   }
-                                 }
+      }
