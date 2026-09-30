@@ -1,7 +1,7 @@
 // ═══════════════════════════════════════════════════════════
 // 🎯 YT Music API - All-in-One
 //    - ?q=...                     → البحث
-//    - ?action=stream&url=...     → الصوت
+//    - ?action=stream&url=...     → الصوت (Progressive + HLS)
 //    - ?action=image&url=...      → الصور
 // ═══════════════════════════════════════════════════════════
 
@@ -171,7 +171,7 @@ async function handleSearch(req, res) {
 }
 
 // ═══════════════════════════════════════════════════════════
-// 🎵 Streaming (Proxy الصوت)
+// 🎵 Streaming (Proxy الصوت - Progressive + HLS)
 // ═══════════════════════════════════════════════════════════
 async function extractDirectUrl(apiUrl, clientId) {
   let urlWithClient = apiUrl;
@@ -193,7 +193,9 @@ async function extractDirectUrl(apiUrl, clientId) {
 
   // الحالة 1: data.url مباشر
   if (data && data.url) {
-    return { url: data.url, isHls: false };
+    // ⚠️ مهم: نتحقق إذا كان الرابط m3u8
+    const isHls = data.url.includes('.m3u8') || data.url.includes('/hls/') || data.url.includes('playlist');
+    return { url: data.url, isHls: isHls };
   }
 
   // الحالة 2: data.media.transcodings
@@ -220,9 +222,10 @@ async function extractDirectUrl(apiUrl, clientId) {
     if (!streamRes.ok) return { url: null, isHls: false };
 
     const streamData = await streamRes.json();
+    const isHls = selected.format.protocol === 'hls';
     return {
       url: streamData.url || null,
-      isHls: selected.format.protocol === 'hls'
+      isHls: isHls
     };
   }
 
@@ -233,6 +236,58 @@ async function handleStream(req, res) {
   const streamUrl = req.query.url;
   if (!streamUrl) {
     return res.status(400).json({ error: 'missing url' });
+  }
+
+  // ═══════════════════════════════════════════════════════════
+  // 🎯 proxy_ts Mode: تمرير أقسام .ts + init.mp4 مباشرة
+  // ═══════════════════════════════════════════════════════════
+  if (req.query.proxy_ts === 'true') {
+    const range = req.headers.range || 'bytes=0-';
+
+    try {
+      const tsResponse = await fetch(streamUrl, {
+        method: 'GET',
+        headers: {
+          'Range': range,
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+          'Accept': '*/*',
+          'Accept-Encoding': 'identity'
+        }
+      });
+
+      if (!tsResponse.ok && tsResponse.status !== 206) {
+        return res.status(tsResponse.status).end();
+      }
+
+      res.status(tsResponse.status);
+
+      ['content-type', 'content-length', 'content-range', 'accept-ranges'].forEach(h => {
+        const v = tsResponse.headers.get(h);
+        if (v) res.setHeader(h, v);
+      });
+
+      res.setHeader('Cache-Control', 'public, max-age=3600');
+      res.setHeader('Access-Control-Allow-Origin', '*');
+
+      const reader = tsResponse.body.getReader();
+      let closed = false;
+      res.on('close', () => {
+        closed = true;
+        reader.cancel().catch(() => {});
+      });
+
+      try {
+        while (!closed) {
+          const { done, value } = await reader.read();
+          if (done || res.writableEnded) break;
+          res.write(value);
+        }
+      } catch (e) {}
+
+      return res.end();
+    } catch (e) {
+      return res.status(500).json({ error: e.message });
+    }
   }
 
   let clientId = await getFreshClientId();
@@ -248,6 +303,85 @@ async function handleStream(req, res) {
   }
 
   const directUrl = result.url;
+  const isHls = result.isHls;
+
+  // ═══════════════════════════════════════════════════════════
+  // 🎯 HLS Mode: أعد كتابة m3u8 ليمر كل قسم عبر proxy
+  // ═══════════════════════════════════════════════════════════
+  if (isHls) {
+    try {
+      const m3u8Res = await fetch(directUrl, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+          'Accept': '*/*'
+        }
+      });
+
+      if (!m3u8Res.ok) {
+        return res.status(m3u8Res.status).json({ error: 'فشل جلب m3u8' });
+      }
+
+      const m3u8Content = await m3u8Res.text();
+
+      const proto = req.headers['x-forwarded-proto'] || 'https';
+      const host = req.headers.host;
+      const baseProxyUrl = `${proto}://${host}/api/search?action=stream&proxy_ts=true&url=`;
+
+      // استخراج base للروابط النسبية
+      const baseDir = directUrl.substring(0, directUrl.lastIndexOf('/'));
+
+      // ═══ إعادة كتابة m3u8 ═══
+      let rewritten = m3u8Content.split('\n').map(line => {
+        const trimmed = line.trim();
+
+        // #EXT-X-MAP:URI="..."
+        if (trimmed.startsWith('#EXT-X-MAP:URI="')) {
+          const match = trimmed.match(/#EXT-X-MAP:URI="([^"]+)"/);
+          if (match) {
+            const absoluteUrl = match[1];
+            const proxyUrl = `${baseProxyUrl}${encodeURIComponent(absoluteUrl)}`;
+            return `#EXT-X-MAP:URI="${proxyUrl}"`;
+          }
+        }
+
+        // #EXT-X-KEY:URI="..." (اختياري)
+        if (trimmed.startsWith('#EXT-X-KEY:') && trimmed.includes('URI="')) {
+          const match = trimmed.match(/URI="([^"]+)"/);
+          if (match) {
+            const absoluteUrl = match[1];
+            const proxyUrl = `${baseProxyUrl}${encodeURIComponent(absoluteUrl)}`;
+            return trimmed.replace(match[1], proxyUrl);
+          }
+        }
+
+        // سطر فارغ أو تعليق آخر
+        if (!trimmed || trimmed.startsWith('#')) {
+          return line;
+        }
+
+        // رابط قسم (.ts, .m4s, init.mp4)
+        let absoluteUrl = trimmed;
+        if (!absoluteUrl.startsWith('http')) {
+          absoluteUrl = `${baseDir}/${absoluteUrl}`;
+        }
+
+        return `${baseProxyUrl}${encodeURIComponent(absoluteUrl)}`;
+      }).join('\n');
+
+      res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+      res.setHeader('Cache-Control', 'public, max-age=300');
+      res.setHeader('Access-Control-Allow-Origin', '*');
+
+      return res.status(200).send(rewritten);
+
+    } catch (e) {
+      return res.status(500).json({ error: 'HLS proxy error: ' + e.message });
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════
+  // 🎵 Progressive Mode
+  // ═══════════════════════════════════════════════════════════
 
   // info mode
   if (req.query.info === 'true') {
@@ -259,8 +393,8 @@ async function handleStream(req, res) {
     return res.status(200).json({
       success: true,
       direct_url: proxyUrl,
-      protocol: result.isHls ? 'hls' : 'progressive',
-      mime_type: result.isHls ? 'application/vnd.apple.mpegurl' : 'audio/mpeg'
+      protocol: 'progressive',
+      mime_type: 'audio/mpeg'
     });
   }
 
@@ -328,7 +462,6 @@ async function handleImage(req, res) {
     return res.status(response.status).end();
   }
 
-  // 🚀 Cache لمدة سنة
   res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
   res.setHeader('Access-Control-Allow-Origin', '*');
 
@@ -371,4 +504,4 @@ export default async function handler(req, res) {
   } catch (error) {
     return res.status(500).json({ error: error.message });
   }
-      }
+        }
