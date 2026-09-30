@@ -32,30 +32,52 @@ async function getFreshClientId(forceRefresh = false) {
   return cachedClientId || 'iZIs9mchVcX5lhVRyQGGAYlNPVldzAoX';
 }
 
-async function getBestStreamUrl(transcodings, clientId) {
-  if (!transcodings || !Array.isArray(transcodings) || transcodings.length === 0) {
-    return null;
+// 🎯 الحل: استخراج URL من JSON بطريقة ذكية
+async function extractDirectUrl(apiUrl, clientId) {
+  let urlWithClient = apiUrl;
+  if (!urlWithClient.includes('client_id=')) {
+    const sep = urlWithClient.includes('?') ? '&' : '?';
+    urlWithClient = `${urlWithClient}${sep}client_id=${clientId}`;
   }
 
-  let selectedTranscoding = transcodings.find(t =>
-    t.format && t.format.protocol === 'progressive'
-  );
+  const response = await fetch(urlWithClient, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+      'Accept': 'application/json'
+    }
+  });
 
-  if (!selectedTranscoding) {
-    selectedTranscoding = transcodings.find(t =>
-      t.format && t.format.protocol === 'hls'
+  if (!response.ok) {
+    return { url: null, isHls: false };
+  }
+
+  const data = await response.json();
+
+  // الحالة 1: data.url مباشر (رابط transcoding)
+  if (data && data.url) {
+    return { url: data.url, isHls: false };
+  }
+
+  // الحالة 2: data.media.transcodings (رابط track)
+  if (data && data.media && data.media.transcodings) {
+    let selectedTranscoding = data.media.transcodings.find(t =>
+      t.format && t.format.protocol === 'progressive'
     );
-  }
 
-  if (!selectedTranscoding) return null;
+    if (!selectedTranscoding) {
+      selectedTranscoding = data.media.transcodings.find(t =>
+        t.format && t.format.protocol === 'hls'
+      );
+    }
 
-  let streamApiUrl = selectedTranscoding.url;
-  if (!streamApiUrl.includes('client_id=')) {
-    const sep = streamApiUrl.includes('?') ? '&' : '?';
-    streamApiUrl = `${streamApiUrl}${sep}client_id=${clientId}`;
-  }
+    if (!selectedTranscoding) return { url: null, isHls: false };
 
-  try {
+    let streamApiUrl = selectedTranscoding.url;
+    if (!streamApiUrl.includes('client_id=')) {
+      const sep = streamApiUrl.includes('?') ? '&' : '?';
+      streamApiUrl = `${streamApiUrl}${sep}client_id=${clientId}`;
+    }
+
     const streamRes = await fetch(streamApiUrl, {
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
@@ -63,17 +85,16 @@ async function getBestStreamUrl(transcodings, clientId) {
       }
     });
 
-    if (!streamRes.ok) return null;
+    if (!streamRes.ok) return { url: null, isHls: false };
 
     const streamData = await streamRes.json();
     return {
       url: streamData.url || null,
       isHls: selectedTranscoding.format.protocol === 'hls'
     };
-  } catch (e) {
-    console.error('خطأ في جلب رابط الصوت:', e);
-    return null;
   }
+
+  return { url: null, isHls: false };
 }
 
 export default async function handler(req, res) {
@@ -93,56 +114,21 @@ export default async function handler(req, res) {
   try {
     let clientId = await getFreshClientId();
 
-    let soundcloudUrl = streamUrl;
-    if (!soundcloudUrl.includes('client_id=')) {
-      const sep = soundcloudUrl.includes('?') ? '&' : '?';
-      soundcloudUrl = `${soundcloudUrl}${sep}client_id=${clientId}`;
+    // استخراج الرابط المباشر
+    let result = await extractDirectUrl(streamUrl, clientId);
+
+    // إذا فشل، جرب client_id جديد
+    if (!result.url) {
+      const freshId = await getFreshClientId(true);
+      result = await extractDirectUrl(streamUrl, freshId);
     }
 
-    let response = await fetch(soundcloudUrl, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Accept': 'application/json, text/javascript, */*; q=0.01'
-      }
-    });
-
-    if (response.status === 401 || response.status === 403) {
-      const freshClientId = await getFreshClientId(true);
-      const sep = streamUrl.includes('?') ? '&' : '?';
-      soundcloudUrl = `${streamUrl}${sep}client_id=${freshClientId}`;
-
-      response = await fetch(soundcloudUrl, {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-          'Accept': 'application/json, text/javascript, */*; q=0.01'
-        }
-      });
-    }
-
-    if (!response.ok) {
-      return res.status(response.status).json({ error: `SoundCloud Error: ${response.statusText}` });
-    }
-
-    const data = await response.json();
-
-    if (!data) {
-      return res.status(404).json({ error: 'لم يتم العثور على بيانات الأغنية' });
-    }
-
-    let directUrl = null;
-    let isHls = false;
-
-    if (data.media && data.media.transcodings) {
-      const streamInfo = await getBestStreamUrl(data.media.transcodings, clientId);
-      if (streamInfo && streamInfo.url) {
-        directUrl = streamInfo.url;
-        isHls = streamInfo.isHls;
-      }
-    }
-
-    if (!directUrl) {
+    if (!result.url) {
       return res.status(404).json({ error: 'عذراً، لا يتوفر مصدر صوت لهذه الأغنية' });
     }
+
+    const directUrl = result.url;
+    const isHls = result.isHls;
 
     // mode info=true
     if (req.query.info === 'true') {
@@ -209,4 +195,4 @@ export default async function handler(req, res) {
   } catch (error) {
     return res.status(500).json({ error: error.message });
   }
-        }
+      }
